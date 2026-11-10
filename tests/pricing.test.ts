@@ -1,0 +1,17 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { priceQuote, defaultSettings } from '../shared/pricing.ts';
+import type { QuoteItemInput } from '../shared/types.ts';
+const customer = { member: '白银' as const, benefit: 'discount' as const };
+const row = (patch: Partial<QuoteItemInput> = {}): QuoteItemInput => ({ id: 'a', mode: '机密', tier: '技术陪', hours: 2, female: false, customerCount: 1, discount: 'member', groupId: '', plannedStart: '', requestedPlayerId: '', promise: '', kind: 'normal', ...patch });
+test('先减整组优惠再逐条会员折扣，组减免只扣一次', () => { const q = priceQuote([row({groupId:'g'}),row({id:'b',groupId:'g'})],customer); assert.equal(q.subtotalCents,48000);assert.equal(q.groupDiscountCents,2000);assert.equal(q.totalCents,43700); });
+test('双陪各3小时不能合并为6小时包时',()=>{ assert.throws(()=>priceQuote([row({hours:3,discount:'sixHour',groupId:'g'}),row({id:'b',hours:3,groupId:'g'})],customer),/6小时/); });
+test('微信权益不享会员折扣，更优惠只提示不自动替换',()=>{const q=priceQuote([row({hours:6})],{member:'白银',benefit:'wechat'});assert.equal(q.totalCents,72000);assert.match(q.items[0].betterDiscount!,/手动/);});
+test('混档人工整组减免精确分摊，报价之和等于总价',()=>{const q=priceQuote([row({hours:3,groupId:'g',groupDiscountHourlyCents:1000}),row({id:'b',tier:'娱乐陪',hours:3,groupId:'g',groupDiscountHourlyCents:1000})],customer); assert.equal(q.totalCents,48450); assert.equal(q.groupDiscountCents,3000); assert.equal(q.items.reduce((a,i)=>a+i.totalCents,0),q.totalCents);});
+test('混档减免缺失时拒绝自动猜测',()=>{assert.throws(()=>priceQuote([row({groupId:'g'}),row({id:'b',tier:'娱乐陪',groupId:'g'})],customer),/混档双陪/);});
+test('娱乐陪一陪二免加价，女陪按人加价且参与折扣',()=>{const q=priceQuote([row({tier:'娱乐陪',customerCount:2,female:true})],customer);assert.equal(q.totalCents,13300);});
+test('明细各选一种折扣，包时优惠不外溢到其他明细',()=>{const q=priceQuote([row({hours:6,discount:'sixHour'}),row({id:'b',tier:'娱乐陪',hours:2})],customer);assert.equal(q.totalCents,70560+11400);});
+test('非法负金额和重复明细拒绝',()=>{assert.throws(()=>priceQuote([row({hours:-1})],customer));assert.throws(()=>priceQuote([row(),row()],customer));});
+test('体验单固定99元且要求明确服务承诺',()=>{assert.throws(()=>priceQuote([row({kind:'trial',discount:'none'})],customer),/体验单/);assert.equal(priceQuote([row({kind:'trial',discount:'none',promise:'客服确认机密单陪1小时'})],customer).totalCents,9900);});
+test('错开预约时段不计算双陪减免',()=>{const q=priceQuote([row({groupId:'g',plannedStart:'2026-11-10T10:00:00+08:00'}),row({id:'b',groupId:'g',plannedStart:'2026-11-10T14:00:00+08:00'})],customer);assert.equal(q.groupDiscountCents,0);});
+test('99元体验不得伪装为高阶或明星档位',()=>{assert.throws(()=>priceQuote([row({kind:'trial',tier:'明星陪',discount:'none',promise:'明确服务安排'})],customer),/仅适用于技术陪/);});

@@ -1,0 +1,76 @@
+<script setup lang="ts">
+import { computed, ref } from 'vue';
+import { useRouter } from 'vue-router';
+import { Download, Refresh, Wallet, Tickets, Coin, TrendCharts, RefreshLeft, CreditCard } from '@element-plus/icons-vue';
+import { state, refresh, can } from '../lib/store';
+import { exportFile, money, notifyError } from '../lib/api';
+import type { Order, Recharge, LedgerEntry } from '../../shared/types';
+
+const router = useRouter();
+const tab = ref('orders');
+const range = ref<string[]>([]);
+const loading = ref(false);
+const dateKey = (value: string) => new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai' }).format(new Date(value));
+const inRange = (value?: string) => !!value && (!range.value?.[0] || dateKey(value) >= range.value[0]) && (!range.value?.[1] || dateKey(value) <= range.value[1]);
+const orders = computed(() => state.orders.filter((o: Order) => inRange(o.createdAt)));
+const payments = computed(() => state.orders.filter((o: Order) => o.payment && inRange(o.payment.createdAt)));
+const recharges = computed(() => state.recharges.filter((r: Recharge) => inRange(r.createdAt)));
+const effectiveRecharges = computed(() => recharges.value.filter(r => !r.reversed && r.kind !== 'opening'));
+const ledger = computed(() => state.ledger.filter((e: LedgerEntry) => inRange(e.createdAt)));
+const refunds = computed(() => state.orders.flatMap((o: Order) => o.refunds.map(r => ({ ...r, orderCode: o.code, customerName: o.customerName }))).filter(r => inRange(r.createdAt)));
+const assignments = computed(() => state.orders.flatMap((o: Order) => o.assignments.map(a => ({ ...a, orderCode: o.code, orderId: o.id, customerName: o.customerName, item: o.items.find(i => i.id === a.itemId) }))).filter(a => inRange(a.assignedAt)));
+const rechargeTotal = computed(() => effectiveRecharges.value.reduce((n, r) => n + r.amountCents, 0));
+const externalTotal = computed(() => payments.value.reduce((n, o) => n + (o.payment?.externalCents || 0), 0));
+const walletTotal = computed(() => payments.value.reduce((n, o) => n + (o.payment?.walletCents || 0), 0));
+const refundTotal = computed(() => refunds.value.reduce((n, r) => n + r.externalCents + r.walletCents, 0));
+const orderExternalRefundTotal = computed(() => refunds.value.reduce((n, r) => n + r.externalCents, 0));
+const principalRefundTotal = computed(() => ledger.value.filter(entry => entry.type === '充值本金退款').reduce((n, entry) => n + Math.max(0, -entry.amountCents), 0));
+const externalRefundTotal = computed(() => orderExternalRefundTotal.value + principalRefundTotal.value);
+const completedOrders = computed(() => payments.value.reduce((n, o) => n + o.totalCents, 0));
+const cashTotal = computed(() => rechargeTotal.value + externalTotal.value - externalRefundTotal.value);
+const earnings = computed(() => assignments.value.reduce((n, a) => n + (a.earningCents || 0), 0));
+const summary = computed(() => [
+  { title: '已结清订单金额', value: completedOrders.value, caption: `${payments.value.length} 笔结清记录 · 退款另列`, icon: Tickets, color: 'purple' },
+  { title: '外部净收款', value: cashTotal.value, caption: '充值 + 订单直付 − 外部退款', icon: Wallet, color: 'blue' },
+  { title: '充值到账', value: rechargeTotal.value, caption: `${effectiveRecharges.value.length} 笔 · 不含期初余额与已撤销充值`, icon: Coin, color: 'green' },
+  { title: '订单外部付款', value: externalTotal.value, caption: '客服确认收到的订单款', icon: CreditCard, color: 'blue' },
+  { title: '余额消费', value: walletTotal.value, caption: '客户储值抵扣 · 不重复计入外部收款', icon: TrendCharts, color: 'purple' },
+  { title: '订单退款', value: refundTotal.value, caption: `其中外部退款 ${money(orderExternalRefundTotal.value)}`, icon: RefreshLeft, color: 'orange' }
+]);
+const exportsMap: Record<string, string> = { orders: 'orders', recharges: 'recharges', ledger: 'ledger', assignments: 'assignments' };
+const doExport = async (format: string) => {
+  try { await exportFile(exportsMap[tab.value] || 'orders', format, { from: range.value?.[0] || '', to: range.value?.[1] || '' }); } catch (e) { notifyError(e); }
+};
+const reload = async () => { loading.value = true; try { await refresh(); } catch (e) { notifyError(e); } finally { loading.value = false; } };
+const formatDate = (value?: string) => value ? new Date(value).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '—';
+const kindLabel: Record<string, string> = { initial: '首充开通', renewal: '会员续充', upgrade: '会员升级', opening: '期初余额' };
+const ledgerLabel: Record<string, string> = { opening: '期初余额', recharge: '充值到账', consumption: '订单消费', payment: '订单消费', order_payment: '订单消费', refund: '余额退款', reversal: '充值更正', recharge_reversal: '充值更正', adjustment: '余额调整' };
+const assignmentLabel: Record<string, string> = { assigned: '待服务', serving: '服务中', completed: '已完成', replaced: '已换人', cancelled: '已取消' };
+const orderLabel = (o: Order) => o.status === 'cancelled' ? '已取消' : o.payment ? '已结清' : o.status === 'confirmed' ? '待结清' : '待客户确认';
+const setThisMonth = () => {
+  const now = new Date();
+  const local = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai' }).format(now);
+  range.value = [local.slice(0, 7) + '-01', local];
+};
+</script>
+
+<template>
+  <div>
+    <div class="page-head"><div><h1 class="page-title">统计与导出</h1><p class="page-subtitle">看清订单、收款与储值变化，做好每一笔记录。</p></div><el-button :icon="Refresh" :loading="loading" @click="reload">刷新数据</el-button></div>
+    <div class="report-range"><div class="range-left"><span>统计日期</span><el-date-picker v-model="range" type="daterange" value-format="YYYY-MM-DD" range-separator="至" start-placeholder="开始日期" end-placeholder="结束日期" style="width:280px;flex-grow:0" /><el-button text @click="setThisMonth">本月</el-button><el-button text @click="range = []">全部时间</el-button></div><span class="range-note">北京时间 · 按记录发生时间统计</span></div>
+    <div class="summary-grid"><div v-for="card in summary" :key="card.title" class="summary-card"><div class="summary-title"><span>{{ card.title }}</span><el-icon :class="card.color" :size="19"><component :is="card.icon" /></el-icon></div><strong>{{ money(card.value) }}</strong><p>{{ card.caption }}</p></div></div>
+    <div class="accounting-note"><el-icon :size="18"><Wallet /></el-icon><span>充值增加客户余额，余额消费抵扣订单；两者不会重复计入外部收款。筛选期内账户本金退还 {{ money(principalRefundTotal) }}，已从外部净收款中扣除，订单退款另列。</span></div>
+    <div v-if="state.user?.role === 'admin'" class="additional-metrics"><span>客户余额总额 <b>{{ money(state.customers.reduce((n, c) => n + c.balanceCents, 0)) }}</b></span><span>筛选期内派单应得 <b>{{ money(earnings) }}</b></span><small>成员应得为人工登记金额，未填写部分按零显示；不自动推算利润。</small></div>
+    <section class="panel data-panel"><div class="data-head"><el-tabs v-model="tab"><el-tab-pane label="订单明细" name="orders" /><el-tab-pane label="充值记录" name="recharges" /><el-tab-pane label="余额流水" name="ledger" /><el-tab-pane label="派单明细" name="assignments" /></el-tabs><el-dropdown v-if="can('export')" @command="doExport"><el-button :icon="Download">导出当前明细</el-button><template #dropdown><el-dropdown-menu><el-dropdown-item command="xlsx">Excel（.xlsx）</el-dropdown-item><el-dropdown-item command="csv">CSV（.csv）</el-dropdown-item></el-dropdown-menu></template></el-dropdown></div>
+      <el-table v-if="tab === 'orders'" :data="orders" empty-text="所选日期内暂无订单" @row-click="(row: Order) => router.push('/orders?orderId=' + row.id)" class="clickable-table"><el-table-column prop="code" label="订单编号" min-width="170" /><el-table-column prop="customerName" label="客户" min-width="100" /><el-table-column label="服务项目" min-width="220"><template #default="{ row }"><div class="service-lines"><span v-for="item in row.items" :key="item.id">{{ item.mode }} · {{ item.tier }} · {{ item.hours }}小时</span></div></template></el-table-column><el-table-column label="应付金额" min-width="110"><template #default="{ row }"><b class="amount">{{ money(row.totalCents) }}</b></template></el-table-column><el-table-column label="余额抵扣" min-width="110"><template #default="{ row }">{{ money(row.payment?.walletCents || 0) }}</template></el-table-column><el-table-column label="外部付款" min-width="110"><template #default="{ row }">{{ money(row.payment?.externalCents || 0) }}</template></el-table-column><el-table-column label="收款情况" min-width="110"><template #default="{ row }"><el-tag size="small" :type="row.payment ? 'success' : row.status === 'cancelled' ? 'info' : 'warning'">{{ orderLabel(row) }}</el-tag></template></el-table-column><el-table-column prop="createdByName" label="开单客服" min-width="100" /><el-table-column label="开单时间" min-width="170"><template #default="{ row }"><span class="date-text">{{ formatDate(row.createdAt) }}</span></template></el-table-column></el-table>
+      <el-table v-else-if="tab === 'recharges'" :data="recharges" empty-text="所选日期内暂无充值记录"><el-table-column prop="customerName" label="客户" min-width="110" /><el-table-column label="类型" min-width="110"><template #default="{ row }"><el-tag size="small" type="info">{{ kindLabel[row.kind] || row.kind }}</el-tag></template></el-table-column><el-table-column label="入账金额" min-width="120"><template #default="{ row }"><b class="amount" :class="{ reversed: row.reversed }">{{ money(row.amountCents) }}</b></template></el-table-column><el-table-column prop="member" label="会员套餐" min-width="100" /><el-table-column prop="channel" label="收款渠道" min-width="100" /><el-table-column prop="reference" label="外部参考号" min-width="160" show-overflow-tooltip /><el-table-column prop="actorName" label="经办客服" min-width="100" /><el-table-column label="状态" width="90"><template #default="{ row }"><el-tag :type="row.reversed ? 'info' : 'success'" size="small">{{ row.reversed ? '已撤销' : '已入账' }}</el-tag></template></el-table-column><el-table-column label="记账时间" min-width="170"><template #default="{ row }"><span class="date-text">{{ formatDate(row.createdAt) }}</span></template></el-table-column><el-table-column prop="note" label="备注" min-width="160" show-overflow-tooltip /></el-table>
+      <el-table v-else-if="tab === 'ledger'" :data="ledger" empty-text="所选日期内暂无余额流水"><el-table-column prop="customerName" label="客户" min-width="110" /><el-table-column label="变动类型" min-width="120"><template #default="{ row }">{{ ledgerLabel[row.type] || row.type }}</template></el-table-column><el-table-column label="变动金额" min-width="120"><template #default="{ row }"><b :class="row.amountCents >= 0 ? 'positive' : 'negative'">{{ row.amountCents > 0 ? '+' : '' }}{{ money(row.amountCents) }}</b></template></el-table-column><el-table-column label="变动后余额" min-width="125"><template #default="{ row }">{{ money(row.balanceAfterCents) }}</template></el-table-column><el-table-column prop="actorName" label="经办人" min-width="100" /><el-table-column prop="note" label="说明" min-width="220" show-overflow-tooltip /><el-table-column label="发生时间" min-width="170"><template #default="{ row }"><span class="date-text">{{ formatDate(row.createdAt) }}</span></template></el-table-column></el-table>
+      <el-table v-else :data="assignments" empty-text="所选日期内暂无派单记录"><el-table-column prop="orderCode" label="订单编号" min-width="170" /><el-table-column prop="customerName" label="客户" min-width="100" /><el-table-column prop="playerName" label="陪玩成员" min-width="110" /><el-table-column label="服务" min-width="160"><template #default="{ row }">{{ row.item?.mode }} · {{ row.item?.tier }}</template></el-table-column><el-table-column label="购买时长" width="100"><template #default="{ row }">{{ row.item?.hours || 0 }}小时</template></el-table-column><el-table-column label="赠时 / 补打" width="110"><template #default="{ row }">{{ row.freeMinutes || 0 }}分钟</template></el-table-column><el-table-column label="进度" width="100"><template #default="{ row }"><el-tag size="small" :type="row.status === 'completed' ? 'success' : 'info'">{{ assignmentLabel[row.status] || row.status }}</el-tag></template></el-table-column><el-table-column v-if="state.user?.role === 'admin'" label="人工应得" min-width="110"><template #default="{ row }"><b class="amount">{{ money(row.earningCents || 0) }}</b></template></el-table-column><el-table-column v-if="state.user?.role === 'admin'" label="结算记录" width="110"><template #default="{ row }"><el-tag size="small" :type="row.settled ? 'success' : 'warning'">{{ row.settled ? '已登记' : '待登记' }}</el-tag></template></el-table-column><el-table-column label="派单时间" min-width="170"><template #default="{ row }"><span class="date-text">{{ formatDate(row.assignedAt) }}</span></template></el-table-column></el-table>
+      <div class="table-note"><span>{{ tab === 'orders' ? '订单按开单时间筛选；上方收款指标按实际记账时间筛选。' : tab === 'assignments' ? '派单按安排时间筛选；换人历史保留为独立记录。' : '流水按记账时间筛选，所有金额单位为人民币。' }}</span><span v-if="!can('export')">当前账号未开通导出权限</span></div>
+    </section>
+  </div>
+</template>
+
+<style scoped>
+.report-range{display:flex;justify-content:space-between;align-items:center;gap:16px;margin:0 0 22px;padding:16px 20px;background:white;border:1px solid #eeeaf4;border-radius:12px}.range-left{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.range-left>span{font-size:12px;color:#90849f}.range-note{font-size:10px;color:#8c8498;white-space:nowrap}.summary-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:17px;margin-bottom:18px}.summary-card{background:white;border:1px solid #ece7f2;border-radius:12px;padding:20px 22px}.summary-title{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:#9689a4}.summary-card>strong{font-size:24px;letter-spacing:-.5px;font-weight:600;color:#5d4e70;display:block;margin-top:15px}.summary-card>p{font-size:10px;color:#8f879b;margin:11px 0 0}.purple{color:#aa93d9}.blue{color:#8eb3dc}.green{color:#8ebfa6}.orange{color:#d7b383}.accounting-note{display:flex;align-items:center;gap:10px;padding:13px 17px;background:#f2effb;color:#9a88ad;border:1px solid #e8e0f3;border-radius:9px;font-size:11px;line-height:1.8;margin-bottom:19px}.accounting-note .el-icon{flex-shrink:0;color:#a48ac9}.additional-metrics{display:flex;gap:27px;align-items:center;flex-wrap:wrap;margin:0 0 21px;padding:0 3px;color:#a092ad;font-size:11px}.additional-metrics b{font-size:13px;font-weight:600;color:#847092;margin-left:9px}.additional-metrics small{font-size:10px;color:#a096a8}.data-panel{padding:21px 23px}.data-head{display:flex;justify-content:space-between;gap:15px;align-items:flex-start;margin-bottom:14px}.data-head .el-tabs{flex:1;min-width:0}.data-head:deep(.el-tabs__header){margin:0}.data-head:deep(.el-tabs__item){font-size:12px}.service-lines{display:flex;flex-direction:column;gap:4px;color:#9c8ba9;font-size:11px}.amount{font-weight:550;color:#7a6592}.reversed{text-decoration:line-through;color:#b6aabd}.date-text{font-size:11px;color:#90839b}.positive{color:#78a98b;font-weight:550}.negative{color:#ad8a9e;font-weight:550}.table-note{display:flex;justify-content:space-between;gap:15px;flex-wrap:wrap;font-size:10px;color:#8c829a;margin-top:17px;line-height:1.8}.clickable-table{cursor:pointer}@media(max-width:1000px){.summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.report-range{flex-wrap:wrap}.range-note{display:none}}@media(max-width:650px){.summary-grid{gap:10px}.summary-card{padding:15px}.summary-card>strong{font-size:19px}.summary-card>p{line-height:1.7}.report-range{padding:13px}.range-left{gap:6px}.data-panel{padding:15px}.data-head{flex-wrap:wrap}.data-head .el-tabs{width:100%;flex-basis:100%}.additional-metrics{gap:12px}.accounting-note{font-size:10px}}
+</style>

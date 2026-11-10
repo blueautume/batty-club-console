@@ -1,0 +1,35 @@
+{
+  "name": "batty-club-console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "node --env-file-if-exists=.env --watch --experimental-strip-types server/index.ts",
+    "dev:web": "vite --host 127.0.0.1",
+    "check": "vue-tsc --noEmit && tsc -p tsconfig.server.json",
+    "build": "npm run check && vite build",
+    "start": "node --env-file-if-exists=.env --experimental-strip-types server/index.ts",
+    "test": "node --experimental-strip-types --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.2",
+    "element-plus": "^2.11.8",
+    "exceljs": "^4.4.0",
+    "express": "^5.1.0",
+    "vue": "^3.5.24",
+    "vue-router": "^4.6.3",
+    "zod": "^4.1.12"
+  },
+  "overrides": { "exceljs": { "uuid": "^11.1.1" } },
+  "devDependencies": {
+    "@types/express": "^5.0.5",
+    "@types/node": "^24.10.0",
+    "@vitejs/plugin-vue": "^6.0.2",
+    "concurrently": "^9.2.1",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.2",
+    "vue-tsc": "^3.1.3"
+  }
+}
