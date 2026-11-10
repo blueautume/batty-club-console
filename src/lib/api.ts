@@ -3,12 +3,15 @@ export class ApiError extends Error {
   status: number;
   constructor(message: string, status: number) { super(message); this.name = 'ApiError'; this.status = status; }
 }
+let authGeneration = 0;
+export function invalidateApiSession(): void { authGeneration++; }
 export async function api<T = any>(path: string, options: RequestInit = {}): Promise<T> {
+  const requestedSession = authGeneration;
   const response = await fetch(path, { credentials: 'same-origin', ...options, headers: { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers } });
   if (!response.ok) {
     let message = `请求失败（${response.status}）`;
     try { const data = await response.json(); message = data.message || data.error || message; } catch {}
-    if (response.status === 401) window.dispatchEvent(new Event('auth:expired'));
+    if (response.status === 401 && requestedSession === authGeneration) window.dispatchEvent(new Event('auth:expired'));
     throw new ApiError(message, response.status);
   }
   if (response.status === 204) return undefined as T;

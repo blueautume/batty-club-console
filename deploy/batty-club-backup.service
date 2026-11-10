@@ -1,0 +1,19 @@
+[Unit]
+Description=Consistent SQLite backup for Batty Club
+After=batty-club.service
+
+[Service]
+Type=oneshot
+User=batty-club
+Group=batty-club
+WorkingDirectory=/opt/batty-club/current
+Environment=DB_PATH=/var/lib/batty-club/batty.sqlite
+Environment=BACKUP_DIR=/var/backups/batty-club
+ExecStart=/opt/batty-club/runtime/bin/node --experimental-strip-types scripts/backup.ts
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/batty-club /var/backups/batty-club
+MemoryMax=256M

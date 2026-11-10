@@ -54,7 +54,26 @@ const draftPayloadSchema = z.object({
 const draftBodySchema = z.object({ title: text(120).optional(), payload: draftPayloadSchema, automatic: z.boolean().default(false) });
 const orderAdjustmentSchema = z.object({ version: z.number().int().positive(), quoteVersion: z.number().int().positive(), amountCents: z.number().int().min(-10_000_000_000).max(10_000_000_000).refine(value => value !== 0, '增减款金额不能为零'), reason: requiredText(1000), idempotencyKey: requiredText(120) });
 
-export function createApp(options: { dbPath?: string; seed?: boolean } = {}) {
+export interface AppOptions {
+  dbPath?: string;
+  seed?: boolean;
+  production?: boolean;
+  publicOrigin?: string;
+  initialAccounts?: { adminUsername?: string; adminPassword?: string; staffUsername?: string; staffPassword?: string };
+}
+
+export function createApp(options: AppOptions = {}) {
+  const production = options.production ?? process.env.NODE_ENV === 'production';
+  let publicOrigin = '';
+  if (production) {
+    try {
+      const configured = new URL(options.publicOrigin ?? process.env.PUBLIC_ORIGIN ?? '');
+      if (configured.protocol !== 'https:' || configured.username || configured.password || configured.pathname !== '/' || configured.search || configured.hash) throw new Error();
+      publicOrigin = configured.origin;
+    } catch { throw new Error('生产环境必须配置有效的 HTTPS PUBLIC_ORIGIN，不含路径、账号或查询参数'); }
+  }
+  const sessionCookieName = production ? 'batty_session' : 'batty_sid';
+  const cookieOptions = { httpOnly: true, sameSite: 'strict' as const, secure: production || process.env.COOKIE_SECURE === 'true', path: '/' };
   const dbPath = options.dbPath || process.env.DB_PATH || path.resolve('data/batty.sqlite');
   if (dbPath !== ':memory:') mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
@@ -66,6 +85,7 @@ export function createApp(options: { dbPath?: string; seed?: boolean } = {}) {
     CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);`);
   const app = express();
   app.disable('x-powered-by');
+  if (production) app.set('trust proxy', 'loopback');
   app.use(express.json({ limit: '2mb' }));
   app.use((req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'same-origin'); if (req.path.startsWith('/api/')) res.setHeader('Cache-Control', 'no-store'); next(); });
   const list = <T>(kind: string): T[] => db.prepare('SELECT payload FROM entities WHERE kind=? ORDER BY rowid DESC').all(kind).map(row => JSON.parse(row.payload as string));
@@ -77,7 +97,7 @@ export function createApp(options: { dbPath?: string; seed?: boolean } = {}) {
   const settings = (): Settings => { const s = maybe<{ id: string; value: Settings }>('settings', 'main'); return clone(s?.value || defaultSettings); };
   const audit = (req: Request | null, action: string, targetType: string, targetId: string, targetName: string, before: unknown = null, after: unknown = null, reason = '', result = 'success', overrideActor?: User) => {
     const actor = overrideActor || (req as unknown as AuthedRequest | null)?.actor;
-    const record: AuditEntry = { id: id(), actorId: actor?.id || '', actorName: actor?.name || '未登录', action, targetType, targetId, targetName, before: before as AuditEntry['before'], after: after as AuditEntry['after'], reason, result, ip: req?.socket.remoteAddress || 'local', createdAt: now() };
+    const record: AuditEntry = { id: id(), actorId: actor?.id || '', actorName: actor?.name || '未登录', action, targetType, targetId, targetName, before: before as AuditEntry['before'], after: after as AuditEntry['after'], reason, result, ip: req?.ip || req?.socket.remoteAddress || 'local', createdAt: now() };
     put('audit', record);
   };
   const has = (user: User, permission: Permission) => user.role === 'admin' || user.permissions.includes(permission);
@@ -134,7 +154,7 @@ export function createApp(options: { dbPath?: string; seed?: boolean } = {}) {
     (order.adjustments ||= []).push({ id: id(), amountCents, reason, actorId: actor.id, actorName: actor.name, createdAt: now(), quoteVersion: order.quoteVersion, previousAdjustmentCents: before.adjustmentCents, adjustmentCents: order.adjustmentCents, previousTotalCents: before.totalCents, totalCents: order.totalCents });
   };
   const sumsRefund = (order: Order) => order.refunds.reduce((sum, r) => ({ wallet: sum.wallet + r.walletCents, external: sum.external + r.externalCents }), { wallet: 0, external: 0 });
-  const fullyRefunded = (order: Order) => { const totals = sumsRefund(order); return !!order.payment && totals.wallet + totals.external >= order.totalCents; };
+  const fullyRefunded = (order: Order) => { const totals = sumsRefund(order); return !!order.payment && totals.wallet + totals.external > 0 && totals.wallet + totals.external >= order.totalCents; };
   const price = (items: QuoteItemInput[], customer: Customer) => { if (new Set(items.map(item => item.id)).size !== items.length) fail(400, '服务明细编号重复'); try { return priceQuote(items, customer, settings()); } catch (error) { fail(400, error instanceof Error ? error.message : '报价参数不正确'); } };
   const validateRequestedPlayers = (items: QuoteItemInput[]) => {
     for (const item of items) if (item.requestedPlayerId) {
@@ -176,23 +196,54 @@ export function createApp(options: { dbPath?: string; seed?: boolean } = {}) {
       put('orders', order); audit(null, '初始化演示数据', 'system', 'seed', '本地试用数据', null, { customers: 3, players: names.length, orders: 1 }, '所有演示资料均为虚构', 'success', admin);
     });
   }
-  if (options.seed !== false) seed();
+  function initializeProduction() {
+    const initialized = db.prepare('SELECT value FROM counters WHERE name=?').get('batty:production');
+    if (list<User>('users').length) {
+      if (!initialized) throw new Error('生产启动拒绝使用未标记的数据库，请使用独立的正式空库');
+      return;
+    }
+    if (initialized || db.prepare('SELECT COUNT(*) AS count FROM entities').get()!.count !== 0) throw new Error('生产初始化需要独立空库，现有数据不会被覆盖');
+    const configured = options.initialAccounts ?? {
+      adminUsername: process.env.ADMIN_INITIAL_USERNAME,
+      adminPassword: process.env.ADMIN_INITIAL_PASSWORD,
+      staffUsername: process.env.STAFF_INITIAL_USERNAME,
+      staffPassword: process.env.STAFF_INITIAL_PASSWORD
+    };
+    const username = z.string().trim().min(3).max(60).regex(/^[a-zA-Z0-9_.-]+$/);
+    const adminUsername = username.safeParse(configured.adminUsername || 'admin');
+    const staffUsername = username.safeParse(configured.staffUsername || 'kefu');
+    const strongPassword = passwordSchema.min(16);
+    const adminPassword = strongPassword.safeParse(configured.adminPassword);
+    const staffPassword = strongPassword.safeParse(configured.staffPassword);
+    if (!adminUsername.success || !staffUsername.success || !adminPassword.success || !staffPassword.success || adminUsername.data.toLowerCase() === staffUsername.data.toLowerCase() || adminPassword.data === staffPassword.data) {
+      throw new Error('正式空库需要两个不同账号及独立初始密码：ADMIN_INITIAL_PASSWORD、STAFF_INITIAL_PASSWORD 各至少16位并含字母与数字；可配置 ADMIN_INITIAL_USERNAME、STAFF_INITIAL_USERNAME');
+    }
+    tx(() => {
+      const admin: StoredUser = { id: 'admin', username: adminUsername.data, name: '管理员', role: 'admin', permissions: [...permissions], active: true, passwordHash: hashPassword(adminPassword.data), mustChangePassword: false };
+      const staff: StoredUser = { id: 'staff-main', username: staffUsername.data, name: '客服', role: 'staff', permissions: [...permissions], active: true, passwordHash: hashPassword(staffPassword.data), mustChangePassword: false };
+      put('users', admin); put('users', staff); put('settings', { id: 'main', value: clone(defaultSettings) });
+      db.prepare('INSERT INTO counters(name,value) VALUES(?,1)').run('batty:production');
+    });
+  }
+  try { if (options.seed !== false) { if (production) initializeProduction(); else seed(); } }
+  catch (error) { db.close(); throw error; }
 
   app.use('/api', (req, _res, next) => {
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
       const origin = req.get('origin');
       const hostOrigin = `${req.protocol}://${req.get('host')}`;
-      const allowed = new Set([hostOrigin, 'http://127.0.0.1:5173', 'http://localhost:5173', ...(process.env.ALLOWED_ORIGINS || '').split(',').filter(Boolean)]);
+      const allowed = new Set(production ? [publicOrigin] : [hostOrigin, 'http://127.0.0.1:5173', 'http://localhost:5173', ...(process.env.ALLOWED_ORIGINS || '').split(',').filter(Boolean)]);
       if (origin && !allowed.has(origin)) return next(new HttpError(403, '不允许从此来源提交操作'));
       if (!req.is('application/json')) return next(new HttpError(415, '请使用JSON格式提交操作'));
     }
     next();
   });
   app.get('/api/health', (_req, res) => res.json({ ok: true, version: '0.1.0', database: 'sqlite', time: now() }));
+  app.get('/api/public-config', (_req, res) => res.json({ demoMode: !production, clubName: settings().clubName }));
   const loginAttempts = new Map<string, { count: number; expires: number }>();
   app.post('/api/login', (req, res) => {
     const body = z.object({ username: requiredText(60), password: z.string().min(1).max(128) }).parse(req.body);
-    const key = `${req.socket.remoteAddress}:${body.username.toLowerCase()}`;
+    const key = `${req.ip || req.socket.remoteAddress}:${body.username.toLowerCase()}`;
     const attempts = loginAttempts.get(key);
     if (attempts && attempts.expires > Date.now() && attempts.count >= 10) fail(429, '登录尝试过多，请15分钟后重试');
     const user = list<StoredUser>('users').find(u => u.username.toLowerCase() === body.username.toLowerCase());
@@ -204,12 +255,12 @@ export function createApp(options: { dbPath?: string; seed?: boolean } = {}) {
     loginAttempts.delete(key);
     const token = randomBytes(32).toString('base64url');
     tx(() => { user.lastLogin = now(); put('users', user); db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(tokenHash(token), user.id, new Date(Date.now() + 7 * 86400000).toISOString()); audit(req, '登录成功', 'account', user.id, user.name, null, null, '', 'success', user); });
-    res.cookie('batty_sid', token, { httpOnly: true, sameSite: 'strict', secure: process.env.COOKIE_SECURE === 'true', maxAge: 7 * 86400000, path: '/' });
+    res.cookie(sessionCookieName, token, { ...cookieOptions, maxAge: 7 * 86400000 });
     res.json(safeUser(user));
   });
   app.use('/api', (req, _res, next) => {
     try {
-      const rawCookie = req.headers.cookie?.split(';').map(v => v.trim()).find(v => v.startsWith('batty_sid='))?.slice('batty_sid='.length);
+      const rawCookie = req.headers.cookie?.split(';').map(v => v.trim()).find(v => v.startsWith(`${sessionCookieName}=`))?.slice(`${sessionCookieName}=`.length);
       if (!rawCookie) fail(401, '请先登录');
       const hash = tokenHash(rawCookie);
       const session = db.prepare('SELECT user_id,expires_at FROM sessions WHERE hash=?').get(hash);
@@ -232,7 +283,7 @@ export function createApp(options: { dbPath?: string; seed?: boolean } = {}) {
     next();
   });
   app.get('/api/me', (req, res) => res.json((req as unknown as AuthedRequest).actor));
-  app.post('/api/logout', (req, res) => { tx(() => { db.prepare('DELETE FROM sessions WHERE hash=?').run((req as unknown as AuthedRequest).sessionHash); audit(req, '退出登录', 'account', (req as unknown as AuthedRequest).actor.id, (req as unknown as AuthedRequest).actor.name); }); res.clearCookie('batty_sid', { path: '/' }); res.json({ ok: true }); });
+  app.post('/api/logout', (req, res) => { tx(() => { db.prepare('DELETE FROM sessions WHERE hash=?').run((req as unknown as AuthedRequest).sessionHash); audit(req, '退出登录', 'account', (req as unknown as AuthedRequest).actor.id, (req as unknown as AuthedRequest).actor.name); }); res.clearCookie(sessionCookieName, cookieOptions); res.json({ ok: true }); });
   app.post('/api/password', (req, res) => {
     const body = z.object({ oldPassword: z.string().min(1).max(128), newPassword: passwordSchema }).parse(req.body);
     const current = get<StoredUser>('users', (req as unknown as AuthedRequest).actor.id);
@@ -246,13 +297,26 @@ export function createApp(options: { dbPath?: string; seed?: boolean } = {}) {
   });
   app.get('/api/quote-drafts/:id', (req, res) => res.json(ownDraft(req, String(req.params.id))));
   app.post('/api/quote-drafts', (req, res) => {
-    checkDraftSize(req.body); const body = draftBodySchema.parse(req.body);
-    const created = tx(() => {
-      const draft: QuoteDraft = { id: id(), title: draftTitle(body.title, body.payload), ownerId: (req as unknown as AuthedRequest).actor.id, payload: body.payload, version: 1, createdAt: now(), updatedAt: now() };
+    checkDraftSize(req.body); const body = draftBodySchema.extend({ creationKey: requiredText(120).optional() }).parse(req.body);
+    const result = tx(() => {
+      const actorId = (req as unknown as AuthedRequest).actor.id;
+      const operationId = body.creationKey ? `quote-draft-create:${tokenHash(JSON.stringify([actorId, body.creationKey]))}` : '';
+      const fingerprint = operationId ? tokenHash(JSON.stringify({ title: body.title || '', payload: body.payload })) : '';
+      if (operationId) {
+        const operation = maybe<{ id: string; ownerId: string; draftId: string; fingerprint: string }>('operations', operationId);
+        if (operation) {
+          if (operation.ownerId !== actorId || operation.fingerprint !== fingerprint) fail(409, '本次暂存编号已使用，填写内容有变化，请核对原草稿或另存一份');
+          const draft = maybe<QuoteDraft>('quoteDrafts', operation.draftId);
+          if (!draft || draft.ownerId !== actorId || draft.archivedAt || draft.version !== 1 || JSON.stringify(draft.payload) !== JSON.stringify(body.payload)) fail(409, '本次填写已暂存，但原草稿已更新、归档或生成订单，请到草稿箱核对');
+          return { repeated: true, draft };
+        }
+      }
+      const draft: QuoteDraft = { id: id(), title: draftTitle(body.title, body.payload), ownerId: actorId, payload: body.payload, version: 1, createdAt: now(), updatedAt: now() };
       put('quoteDrafts', draft);
+      if (operationId) put('operations', { id: operationId, ownerId: actorId, draftId: draft.id, fingerprint, createdAt: now() });
       audit(req, body.automatic ? '自动暂存开单草稿' : '暂存开单草稿', 'quoteDraft', draft.id, draft.title, null, draftSummary(draft), '仅保存填写内容，不生成订单、不影响余额');
-      return draft;
-    }); res.status(201).json(created);
+      return { repeated: false, draft };
+    }); res.status(result.repeated ? 200 : 201).json(result.draft);
   });
   app.put('/api/quote-drafts/:id', (req, res) => {
     checkDraftSize(req.body); const body = draftBodySchema.extend({ version: z.number().int().positive() }).parse(req.body);
@@ -299,7 +363,7 @@ export function createApp(options: { dbPath?: string; seed?: boolean } = {}) {
     const totals = dashboard(orders, customers, players, recharges);
     const safeOrders = actor.role === 'admin' ? orders : orders.map(o => ({ ...o, assignments: o.assignments.map(a => ({ ...a, earningCents: 0, settled: false })) }));
     if (actor.role !== 'admin') totals.earningsCents = 0;
-    const payload: Bootstrap = { user: actor, customers, players, orders: safeOrders, recharges, ledger: list<LedgerEntry>('ledger'), audit: actor.role === 'admin' ? list<AuditEntry>('audit').slice(0, 2000) : list<AuditEntry>('audit').filter(a => !['account', 'settings', 'permission', 'export', 'system'].includes(a.targetType) && (a.targetType !== 'quoteDraft' || a.actorId === actor.id)).map(a => ({ ...a, ip: '' })).slice(0, 1000), staff: list<StoredUser>('users').filter(u => u.active).map(u => ({ id: u.id, name: u.name })), accounts: actor.role === 'admin' ? list<StoredUser>('users').map(safeUser) : [], settings: settings(), dashboard: totals };
+    const payload: Bootstrap = { demoMode: !production, user: actor, customers, players, orders: safeOrders, recharges, ledger: list<LedgerEntry>('ledger'), audit: actor.role === 'admin' ? list<AuditEntry>('audit').slice(0, 2000) : list<AuditEntry>('audit').filter(a => !['account', 'settings', 'permission', 'export', 'system'].includes(a.targetType) && (a.targetType !== 'quoteDraft' || a.actorId === actor.id)).map(a => ({ ...a, ip: '' })).slice(0, 1000), staff: list<StoredUser>('users').filter(u => u.active).map(u => ({ id: u.id, name: u.name })), accounts: actor.role === 'admin' ? list<StoredUser>('users').map(safeUser) : [], settings: settings(), dashboard: totals };
     res.json(payload);
   });
 
@@ -497,16 +561,28 @@ export function createApp(options: { dbPath?: string; seed?: boolean } = {}) {
   }
   app.post('/api/orders/:id/assign', (req, res) => { const body = z.object({ itemId: requiredText(100), playerId: requiredText(80), reason: text(1000).default(''), allowConflict: z.boolean().default(false) }).parse(req.body); const result = tx(() => { const order = get<Order>('orders', String(req.params.id)); if (order.kind === 'supplement') fail(409, '补款单只登记费用，不产生陪玩派单'); if (order.status !== 'paid' || fullyRefunded(order)) fail(409, '只有已结清且未全额退款的订单可以派单'); if (order.assignments.some(a => a.itemId === body.itemId && ['assigned', 'serving', 'completed'].includes(a.status))) fail(409, '此项已有派单，请使用换人操作'); const player = validateAssignment(order, body.itemId, body.playerId, body.reason, body.allowConflict); const assignment: Assignment = { id: id(), itemId: body.itemId, playerId: player.id, playerName: player.name, status: 'assigned', assignedAt: now(), reason: body.reason, freeMinutes: 0, earningCents: 0, settled: false }; order.assignments.push(assignment); saveOrder(order); audit(req, '关联派单成员', 'order', order.id, order.code, null, { itemId: body.itemId, playerId: player.id, playerName: player.name, assignmentId: assignment.id }, body.reason); return order; }); res.json(result); });
   app.post('/api/orders/:id/assignment/:assignmentId', (req, res) => {
-    const body = z.object({ action: z.enum(['start', 'complete', 'replace', 'free', 'earning']), playerId: text(80).optional(), reason: text(1000).default(''), minutes: z.number().int().min(1).max(10080).optional(), earningCents: money.optional(), settled: z.boolean().optional(), allowConflict: z.boolean().default(false) }).parse(req.body);
+    const body = z.object({ action: z.enum(['start', 'complete', 'replace', 'free', 'earning']), playerId: text(80).optional(), reason: text(1000).default(''), minutes: z.number().int().min(1).max(10080).optional(), earningCents: money.optional(), settled: z.boolean().optional(), allowConflict: z.boolean().default(false), idempotencyKey: requiredText(120).optional() }).parse(req.body);
     const result = tx(() => {
-      const order = get<Order>('orders', String(req.params.id)); if (body.action === 'earning' ? !order.payment : order.status !== 'paid') fail(409, '此订单当前不能安排服务');
+      const order = get<Order>('orders', String(req.params.id));
+      const operationId = body.action === 'free' && body.idempotencyKey ? `assignment-free:${body.idempotencyKey}` : '';
+      const fingerprint = operationId ? tokenHash(JSON.stringify(body)) : '';
+      if (operationId) {
+        const operation = maybe<{ id: string; targetId: string; assignmentId: string; fingerprint: string }>('operations', operationId);
+        if (operation) {
+          if (operation.targetId !== order.id || operation.assignmentId !== req.params.assignmentId || operation.fingerprint !== fingerprint) fail(409, '本次赠时请求编号已使用，请核对原记录');
+          return order;
+        }
+      }
+      if (body.action === 'earning' ? !order.payment : order.status !== 'paid') fail(409, '此订单当前不能安排服务');
       const assignment = order.assignments.find(a => a.id === req.params.assignmentId); if (!assignment) fail(404, '派单记录不存在'); const before = clone(assignment); let action = '';
       if (body.action === 'start') { if (assignment.status !== 'assigned') fail(409, '只有待服务的派单可以开始'); assignment.status = 'serving'; assignment.startedAt = now(); action = '登记服务开始'; }
       if (body.action === 'complete') { if (assignment.status !== 'serving') fail(409, '只有服务中的派单可以完成'); assignment.status = 'completed'; assignment.endedAt = now(); action = '登记服务完成'; }
       if (body.action === 'free') { if (!['assigned', 'serving', 'completed'].includes(assignment.status)) fail(409, '此派单不能增加赠时'); if (!body.minutes) fail(400, '请填写赠时或补打分钟数'); requireReason(body.reason); assignment.freeMinutes += body.minutes; assignment.freeReason = [assignment.freeReason, `${body.minutes}分钟：${body.reason}`].filter(Boolean).join('；'); action = '登记免费补时或补打'; }
       if (body.action === 'earning') { assertAdmin(req); if (body.earningCents === undefined) fail(400, '请填写成员应得金额'); assignment.earningCents = body.earningCents; assignment.settled = body.settled ?? assignment.settled; action = '登记陪玩应得金额'; }
       if (body.action === 'replace') { if (!['assigned', 'serving'].includes(assignment.status)) fail(409, '只有待服务或服务中的派单可以换人'); requireReason(body.reason); if (!body.playerId || body.playerId === assignment.playerId) fail(400, '请选择另一位陪玩'); const player = validateAssignment(order, assignment.itemId, body.playerId, body.reason, body.allowConflict, assignment.id); assignment.status = 'replaced'; assignment.endedAt = now(); assignment.reason = body.reason; order.assignments.push({ id: id(), itemId: assignment.itemId, playerId: player.id, playerName: player.name, status: 'assigned', assignedAt: now(), reason: body.reason, freeMinutes: 0, earningCents: 0, settled: false }); action = '更换陪玩成员'; }
-      saveOrder(order); audit(req, action, 'order', order.id, order.code, before, assignment, body.reason); return order;
+      saveOrder(order);
+      if (operationId) put('operations', { id: operationId, targetId: order.id, assignmentId: assignment.id, fingerprint, createdAt: now() });
+      audit(req, action, 'order', order.id, order.code, before, assignment, body.reason); return order;
     }); res.json(result);
   });
   app.post('/api/orders/:id/refund', (req, res) => {
@@ -517,7 +593,7 @@ export function createApp(options: { dbPath?: string; seed?: boolean } = {}) {
       if (body.walletCents + body.externalCents <= 0) fail(400, '退款金额必须大于零');
       const refunded = sumsRefund(order); if (body.walletCents > order.payment.walletCents - refunded.wallet || body.externalCents > order.payment.externalCents - refunded.external) fail(400, '退款金额超过对应付款来源的剩余可退金额');
       const unstartedCents = order.items.filter(item => !order.assignments.some(a => a.itemId === item.id && a.startedAt)).reduce((sum, item) => sum + item.totalCents, 0);
-      const staffRefundLimitCents = Math.max(0, unstartedCents - refunded.wallet - refunded.external);
+      const staffRefundLimitCents = Math.max(0, unstartedCents + Math.min(0, order.adjustmentCents) - refunded.wallet - refunded.external);
       if ((req as unknown as AuthedRequest).actor.role !== 'admin' && body.walletCents + body.externalCents > staffRefundLimitCents) fail(403, '退款超出未开始服务部分的可退金额，已消费服务退费需管理员处理');
       if (body.externalCents > 0 && !body.reference) fail(400, '外部退款请填写实际退款参考号或凭证编号');
       const actor = (req as unknown as AuthedRequest).actor;
@@ -529,7 +605,21 @@ export function createApp(options: { dbPath?: string; seed?: boolean } = {}) {
       saveOrder(order); audit(req, '登记订单退款', 'order', order.id, order.code, { walletRefundedCents: refunded.wallet, externalRefundedCents: refunded.external }, { walletCents: body.walletCents, externalCents: body.externalCents, reference: body.reference, status: order.status }, body.reason); return order;
     }); res.json(result);
   });
-  app.post('/api/orders/:id/cancel', (req, res) => { const reason = requireReason(req.body.reason); const result = tx(() => { const order = get<Order>('orders', String(req.params.id)); if (order.status === 'cancelled') fail(409, '订单已经取消'); if (order.payment && !fullyRefunded(order)) fail(409, '已结清订单请通过退款操作处理剩余服务，保留款项来源'); const before = order.status; order.status = 'cancelled'; saveOrder(order); audit(req, '取消未结清订单', 'order', order.id, order.code, { status: before }, { status: 'cancelled' }, reason); return order; }); res.json(result); });
+  app.post('/api/orders/:id/cancel', (req, res) => {
+    const reason = requireReason(req.body.reason);
+    const result = tx(() => {
+      const order = get<Order>('orders', String(req.params.id));
+      if (order.status === 'cancelled') fail(409, '订单已经取消');
+      if (order.payment && order.payment.walletCents + order.payment.externalCents > 0 && !fullyRefunded(order)) fail(409, '已结清订单请通过退款操作处理剩余服务，保留款项来源');
+      const before = { status: order.status, assignments: clone(order.assignments) };
+      order.assignments.forEach(assignment => {
+        if (['assigned', 'serving'].includes(assignment.status)) { assignment.status = 'cancelled'; assignment.endedAt = now(); assignment.reason = reason; }
+      });
+      order.status = 'cancelled'; saveOrder(order);
+      audit(req, '取消订单及剩余安排', 'order', order.id, order.code, before, { status: order.status, assignments: order.assignments }, reason);
+      return order;
+    }); res.json(result);
+  });
   app.post('/api/orders/:id/owner', (req, res) => { const body = z.object({ ownerId: requiredText(80), reason: requiredText(1000) }).parse(req.body); const result = tx(() => { const order = get<Order>('orders', String(req.params.id)); const oldOwner = order.ownerId; order.ownerId = owner(body.ownerId, oldOwner); saveOrder(order); audit(req, '交接订单跟进人', 'order', order.id, order.code, { ownerId: oldOwner }, { ownerId: order.ownerId }, body.reason); return order; }); res.json(result); });
 
   app.post('/api/accounts', (req, res) => {

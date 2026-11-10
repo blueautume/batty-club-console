@@ -1,12 +1,16 @@
-import type { QuoteDraftPayload } from '../../shared/types.ts';
+import type { QuoteDraft, QuoteDraftPayload } from '../../shared/types.ts';
 
-export interface QuoteRecovery {
+export interface QuoteRecoverySource {
+  serverDraftId?: string;
+  serverVersion?: number;
+  conflicted?: boolean;
+  pendingCreation?: boolean;
+}
+export interface QuoteRecovery extends QuoteRecoverySource {
   id: string;
   userId: string;
   payload: QuoteDraftPayload;
   title: string;
-  serverDraftId?: string;
-  serverVersion?: number;
   updatedAt: string;
 }
 export interface RecoveryStorage {
@@ -25,6 +29,21 @@ function browserStorage(): RecoveryStorage | undefined {
 export function writeQuoteRecovery(recovery: QuoteRecovery, storage: RecoveryStorage | undefined = browserStorage()): boolean {
   if (!storage || !recovery.userId || !recovery.id) return false;
   try { storage.setItem(key(recovery.userId, recovery.id), JSON.stringify(recovery)); return true; } catch { return false; }
+}
+/** A restored edit still belongs to the version it was made against, not the latest fetched draft. */
+export function restoredQuoteRecoverySource(recovery: QuoteRecoverySource, draft: Pick<QuoteDraft, 'id' | 'version'> | null): QuoteRecoverySource {
+  return {
+    serverDraftId: recovery.serverDraftId,
+    serverVersion: recovery.serverVersion,
+    pendingCreation: recovery.pendingCreation,
+    conflicted: !!recovery.conflicted || !!recovery.serverDraftId && (!draft || draft.id !== recovery.serverDraftId || draft.version !== recovery.serverVersion)
+  };
+}
+/** Keep recovery in sync with the visible edit, including undo back to the saved version. */
+export function syncQuoteRecovery(recovery: QuoteRecovery, baselineFingerprint: string, storage: RecoveryStorage | undefined = browserStorage()): boolean {
+  if (recovery.conflicted || recovery.pendingCreation || JSON.stringify(recovery.payload) !== baselineFingerprint) return writeQuoteRecovery(recovery, storage);
+  if (!storage) return false;
+  try { storage.removeItem(key(recovery.userId, recovery.id)); return true; } catch { return false; }
 }
 export function readQuoteRecovery(userId: string, id: string, storage: RecoveryStorage | undefined = browserStorage()): QuoteRecovery | null {
   if (!storage) return null;

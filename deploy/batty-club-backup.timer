@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily backup for Batty Club at 03:30 Shanghai time
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=300
+Unit=batty-club-backup.service
+
+[Install]
+WantedBy=timers.target

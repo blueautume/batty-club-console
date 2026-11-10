@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue';
-import { useRoute, useRouter } from 'vue-router';
+import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue';
+import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import type { Customer, Membership, Order, Recharge } from '../../shared/types';
 import { api, money, notifyError, exportFile } from '../lib/api';
 import { state, refresh, can } from '../lib/store';
+import { registerEditorLeaveGuard } from '../lib/leaveGuard';
 import MemberBadge from '../components/MemberBadge.vue';
 
 const route = useRoute();
@@ -13,6 +14,15 @@ const search = ref('');
 const memberFilter = ref('');
 const activeTab = ref(String(route.query.tab || 'customers'));
 const busy = ref(false);
+const savingCustomer = ref(false);
+const editorOwner = state.user.id;
+let alive = true;
+function currentEditor() { return alive && state.user.id === editorOwner; }
+function mayLeave() { if (!savingCustomer.value) return true; ElMessage.warning('正在保存客户资料，请稍候再离开'); return false; }
+const unregisterLeaveGuard = registerEditorLeaveGuard(async () => mayLeave());
+onBeforeRouteLeave(() => mayLeave());
+onBeforeRouteUpdate(() => mayLeave());
+onBeforeUnmount(() => { alive = false; unregisterLeaveGuard(); });
 const editing = ref<Customer | null>(null);
 const editorOpen = ref(false);
 const quoteDraftId = computed(() => typeof route.query.quoteDraftId === 'string' ? route.query.quoteDraftId : '');
@@ -106,29 +116,46 @@ function orderLabel(o: Order) { return ({ draft: '待客户确认', confirmed: '
 function orderTone(o: Order) { return o.status === 'paid' ? 'success' : o.status === 'cancelled' ? 'info' : 'warning'; }
 function lastOrder(customerId: string) { const order = state.orders.find(o => o.customerId === customerId); return order ? localDate(order.createdAt) : '尚未下单'; }
 function openEditor(customer?: Customer) {
+  if (busy.value || !currentEditor()) return;
   editing.value = customer || null;
   Object.assign(form, customer ? { name: customer.name, contactType: customer.contactType, contact: customer.contact, source: customer.source, tagsText: customer.tags.join('，'), notes: customer.notes, ownerId: customer.ownerId, active: customer.active } : { name: '', contactType: '微信', contact: '', source: '', tagsText: '', notes: '', ownerId: state.user?.id || '', active: true });
   editorOpen.value = true;
 }
+function retainSavedCustomer(saved: Customer) {
+  const index = state.customers.findIndex(c => c.id === saved.id);
+  if (index < 0) state.customers.unshift(saved);
+  else if (state.customers[index].version <= saved.version) state.customers[index] = saved;
+}
 async function saveCustomer(startOrder = false) {
+  if (busy.value || !currentEditor()) return;
   if (!form.name.trim() || !form.contact.trim()) { ElMessage.warning('请填写客户称呼和联系号码'); return; }
-  if (duplicateCustomer.value) {
-    try { await ElMessageBox.confirm(`号码与「${duplicateCustomer.value.name}」重复，请确认是独立客户后继续。`, '核对客户信息', { type: 'warning', confirmButtonText: '确认继续', cancelButtonText: '返回核对' }); } catch { return; }
-  }
   busy.value = true;
+  savingCustomer.value = true;
+  const edited = editing.value;
   const returnDraftId = returningToQuote.value ? quoteDraftId.value : '';
+  const duplicate = duplicateCustomer.value;
+  const payload = { name: form.name.trim(), contactType: form.contactType, contact: form.contact.trim(), source: form.source.trim(), tags: form.tagsText.split(/[,，]/).map(t => t.trim()).filter(Boolean).slice(0, 12), notes: form.notes, ownerId: form.ownerId, active: form.active, ...(edited ? { version: edited.version } : {}) };
   try {
-    const payload = { name: form.name.trim(), contactType: form.contactType, contact: form.contact.trim(), source: form.source.trim(), tags: form.tagsText.split(/[,，]/).map(t => t.trim()).filter(Boolean).slice(0, 12), notes: form.notes, ownerId: form.ownerId, active: form.active, ...(editing.value ? { version: editing.value.version } : {}) };
-    const saved = await api<Customer>(editing.value ? `/api/customers/${editing.value.id}` : '/api/customers', { method: editing.value ? 'PUT' : 'POST', body: JSON.stringify(payload) });
-    await refresh();
+    if (duplicate) {
+      try { await ElMessageBox.confirm(`号码与「${duplicate.name}」重复，请确认是独立客户后继续。`, '核对客户信息', { type: 'warning', confirmButtonText: '确认继续', cancelButtonText: '返回核对' }); } catch { return; }
+    }
+    if (!currentEditor()) return;
+    const saved = await api<Customer>(edited ? `/api/customers/${edited.id}` : '/api/customers', { method: edited ? 'PUT' : 'POST', body: JSON.stringify(payload) });
+    if (!currentEditor()) return;
+    retainSavedCustomer(saved);
+    editing.value = saved;
     editorOpen.value = false;
-    ElMessage.success(editing.value ? '客户资料已更新' : '客户档案已建立');
+    savingCustomer.value = false;
+    ElMessage.success(edited ? '客户资料已更新' : '客户档案已建立');
+    try { await refresh(true); } catch { if (currentEditor()) ElMessage.warning('客户档案已保存，其他列表暂未刷新，请勿重复建档'); }
+    if (!currentEditor()) return;
+    retainSavedCustomer(saved);
     if (returnDraftId) await router.push({ path: '/quotes', query: { draftId: returnDraftId, customerId: saved.id } });
     else if (startOrder) await router.push({ path: '/quotes', query: { customerId: saved.id } });
-  } catch (error) { notifyError(error); } finally { busy.value = false; }
+  } catch (error) { if (currentEditor()) notifyError(error); } finally { busy.value = false; savingCustomer.value = false; }
 }
 async function returnToQuoteDraft() {
-  if (!quoteDraftId.value) return;
+  if (busy.value || !currentEditor() || !quoteDraftId.value) return;
   editorOpen.value = false;
   await router.push({ path: '/quotes', query: { draftId: quoteDraftId.value } });
 }
@@ -147,7 +174,7 @@ async function saveMembership() {
   busy.value = true;
   try {
     await api(`/api/customers/${c.id}`, { method: 'PUT', body: JSON.stringify({ version: c.version, ...memberForm }) });
-    await refresh(); syncMembership(); ElMessage.success('会员处理记录已保存');
+    await refresh(true); syncMembership(); ElMessage.success('会员处理记录已保存');
   } catch (error) { notifyError(error); } finally { busy.value = false; }
 }
 function openRecharge(customer: Customer) {
@@ -163,7 +190,7 @@ async function submitRecharge() {
   busy.value = true;
   try {
     await api('/api/recharges', { method: 'POST', body: JSON.stringify({ customerId: rechargeCustomerId.value, amountCents: Math.round(recharge.amount * 100), kind: recharge.kind, member: recharge.member, benefit: recharge.benefit, channel: recharge.channel, reference: recharge.reference, note: recharge.note, exceptionReason: recharge.exceptionReason }) });
-    await refresh(); rechargeOpen.value = false; ElMessage.success('充值到账已登记，余额和会员记录已更新');
+    await refresh(true); rechargeOpen.value = false; ElMessage.success('充值到账已登记，余额和会员记录已更新');
   } catch (error) { notifyError(error); } finally { busy.value = false; }
 }
 async function reverseRecharge(item: Recharge) {
@@ -171,7 +198,7 @@ async function reverseRecharge(item: Recharge) {
     const { value } = await ElMessageBox.prompt('请记录误登记原因。系统会生成反向流水；涉及会员资格需另行核实。', '撤销充值登记', { inputType: 'textarea', inputValidator: value => !!value?.trim() || '请填写处理原因', confirmButtonText: '确认撤销', cancelButtonText: '取消', type: 'warning' });
     busy.value = true;
     await api(`/api/recharges/${item.id}/reverse`, { method: 'POST', body: JSON.stringify({ reason: value }) });
-    await refresh(); ElMessage.success('充值已冲回，原记录继续保留');
+    await refresh(true); ElMessage.success('充值已冲回，原记录继续保留');
   } catch (error) { if (error !== 'cancel' && error !== 'close') notifyError(error); } finally { busy.value = false; }
 }
 function openWalletRefund(customer: Customer) {
@@ -190,7 +217,7 @@ async function submitWalletRefund() {
   busy.value = true;
   try {
     await api(`/api/customers/${customer.id}/wallet-refund`, { method: 'POST', body: JSON.stringify({ amountCents, channel: walletRefund.channel, reference: walletRefund.reference.trim(), reason: walletRefund.reason.trim(), idempotencyKey: walletRefund.idempotencyKey, ...(walletRefund.rechargeId ? { rechargeId: walletRefund.rechargeId } : {}) }) });
-    await refresh(); walletRefundOpen.value = false;
+    await refresh(true); walletRefundOpen.value = false;
     ElMessage.success('本金退款已登记，余额流水已更新；请继续核实会员资格');
   } catch (error) { notifyError(error); } finally { busy.value = false; }
 }
@@ -241,10 +268,10 @@ async function download(type: string, format: 'xlsx' | 'csv' = 'xlsx') {
       </el-tabs>
     </div>
 
-    <el-drawer v-model="editorOpen" :title="editing ? '编辑客户档案' : '新增客户档案'" size="min(520px, 96vw)" :close-on-click-modal="!busy">
+    <el-drawer v-model="editorOpen" :title="editing ? '编辑客户档案' : '新增客户档案'" size="min(520px, 96vw)" :close-on-click-modal="!busy" :close-on-press-escape="!busy" :show-close="!busy">
       <p class="drawer-intro">先登记称呼与联系方式，即可开始报价。会员与余额通过对应记录管理。</p>
       <el-alert v-if="returningToQuote" title="原报价已暂存为草稿。保存客户后会返回原报价，继续填写之前的服务安排；取消不会删除草稿。" type="info" :closable="false" show-icon class="form-alert" />
-      <el-form :model="form" label-position="top" @submit.prevent>
+      <el-form :model="form" :disabled="busy" label-position="top" @submit.prevent>
         <el-form-item label="客户称呼" required><el-input v-model="form.name" maxlength="40" show-word-limit placeholder="方便客服识别的称呼" /></el-form-item>
         <div class="form-grid contact-grid"><el-form-item label="号码类型" required><el-select v-model="form.contactType"><el-option v-for="type in contactTypes" :key="type" :label="type" :value="type" /></el-select></el-form-item><el-form-item label="联系号码" required><el-input v-model="form.contact" maxlength="80" placeholder="微信号、QQ或手机号码" /></el-form-item></div>
         <el-alert v-if="duplicateCustomer" :title="`已有客户「${duplicateCustomer.name}」使用相同号码，请核对。`" type="warning" :closable="false" show-icon class="form-alert" />

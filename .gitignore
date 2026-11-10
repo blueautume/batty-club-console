@@ -8,3 +8,10 @@ data/
 !.env.example
 *.log
 .DS_Store
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+.deploy-private/
