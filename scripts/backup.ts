@@ -3,7 +3,7 @@ import { mkdirSync, chmodSync } from 'node:fs';
 import path from 'node:path';
 
 const databasePath = process.env.DB_PATH || '/var/lib/batty-club/batty.sqlite';
-const backupDirectory = process.env.BACKUP_DIR || '/var/backups/batty-club';
+const backupDirectory = process.env.BACKUP_DIR || '/var/lib/batty-club-backups';
 mkdirSync(backupDirectory, { recursive: true, mode: 0o700 });
 const stamp = new Date().toISOString().replaceAll(':', '-');
 const target = path.join(backupDirectory, `batty-${stamp}.sqlite`);

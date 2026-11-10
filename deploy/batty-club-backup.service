@@ -8,12 +8,12 @@ User=batty-club
 Group=batty-club
 WorkingDirectory=/opt/batty-club/current
 Environment=DB_PATH=/var/lib/batty-club/batty.sqlite
-Environment=BACKUP_DIR=/var/backups/batty-club
+Environment=BACKUP_DIR=/var/lib/batty-club-backups
 ExecStart=/opt/batty-club/runtime/bin/node --experimental-strip-types scripts/backup.ts
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/batty-club /var/backups/batty-club
+ReadWritePaths=/var/lib/batty-club /var/lib/batty-club-backups
 MemoryMax=256M
