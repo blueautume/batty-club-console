@@ -6,6 +6,8 @@ import 'element-plus/dist/index.css';
 import './styles/pure-reset.css';
 import './styles/app.css';
 import App from './App.vue';
+import { authenticated, state } from './lib/store';
+import { isAdminRole } from '../shared/roles';
 const router=createRouter({history:createWebHistory(),routes:[
   {path:'/',redirect:'/dashboard'},
   {path:'/dashboard',component:()=>import('./views/DashboardView.vue')},
@@ -19,4 +21,9 @@ const router=createRouter({history:createWebHistory(),routes:[
   {path:'/settings',component:()=>import('./views/SettingsView.vue')},
   {path:'/:pathMatch(.*)*',redirect:'/dashboard'}
 ]});
+router.beforeEach(to => {
+  if (!authenticated.value) return;
+  if (state.user.role === 'shareholder' && to.path !== '/reports') return '/reports';
+  if (['/management', '/settings'].includes(to.path) && !isAdminRole(state.user.role)) return '/dashboard';
+});
 createApp(App).use(router).use(ElementPlus,{locale:zhCn}).mount('#app');

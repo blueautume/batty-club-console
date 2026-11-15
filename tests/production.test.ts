@@ -38,7 +38,7 @@ test('正式初始化只有两个账号及规则配置，没有演示客户、�
     const counts = f.service.db.prepare('SELECT kind,COUNT(*) AS count FROM entities GROUP BY kind ORDER BY kind').all();
     assert.deepEqual(counts.map(row => [row.kind, row.count]), [['settings', 1], ['users', 2]]);
     const users = f.service.db.prepare('SELECT payload FROM entities WHERE kind=?').all('users').map(row => JSON.parse(row.payload as string));
-    assert.deepEqual(users.map(user => [user.username, user.role]).sort(), [['admin', 'admin'], ['kefu', 'staff']]);
+    assert.deepEqual(users.map(user => [user.username, user.role]).sort(), [['admin', 'root'], ['kefu', 'staff']]);
     assert.ok(users.every(user => user.active && user.passwordHash && !user.password && !user.passwordHash.includes(initialAccounts.adminPassword)));
     const config = await f.request('/api/public-config'); assert.equal(config.status, 200); assert.deepEqual(Object.keys(config.data).sort(), ['clubName', 'demoMode']); assert.equal(config.data.demoMode, false);
     assert.equal((await f.request('/api/bootstrap')).status, 401);
@@ -55,7 +55,7 @@ test('正式账号密码登录使用独立Secure Host-only Cookie，演示密码
     const login = await f.request('/api/login', { username: 'admin', password: initialAccounts.adminPassword });
     assert.equal(login.status, 200); const cookie = login.headers.get('set-cookie')!;
     assert.match(cookie, /^batty_session=/); assert.match(cookie, /HttpOnly/); assert.match(cookie, /Secure/); assert.match(cookie, /SameSite=Strict/); assert.doesNotMatch(cookie, /Domain=/i);
-    assert.equal((await f.request('/api/me')).data.role, 'admin');
+    assert.equal((await f.request('/api/me')).data.role, 'root');
     const logout = await f.request('/api/logout', {}); assert.equal(logout.status, 200); assert.match(logout.headers.get('set-cookie')!, /^batty_session=/); assert.match(logout.headers.get('set-cookie')!, /Secure/);
     assert.equal((await f.request('/api/bootstrap')).status, 401);
     const staff = await f.request('/api/login', { username: 'kefu', password: initialAccounts.staffPassword }); assert.equal(staff.status, 200); assert.equal(staff.data.role, 'staff');

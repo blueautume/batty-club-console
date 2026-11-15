@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { isAdminRole } from '../../shared/roles';
 import { computed, reactive, ref, watch, onBeforeUnmount, onMounted } from 'vue';
 import { useRoute, useRouter, onBeforeRouteLeave, onBeforeRouteUpdate } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
@@ -24,7 +25,7 @@ const op = reactive({ orderId: '', code: '', customerName: '', totalCents: 0, qu
 const stages = ['待确认 / 待收款', '待安排陪玩', '待客户确认', '待结清', '待派单', '部分派单', '待服务', '服务中', '已完成', '已结清补款', '已取消'];
 const selected = computed(() => state.orders.find(o => o.id === detailId.value));
 const customer = computed(() => state.customers.find(c => c.id === selected.value?.customerId));
-const isAdmin = computed(() => state.user.role === 'admin');
+const isAdmin = computed(() => isAdminRole(state.user.role));
 const linkedOrders = computed(() => state.orders.filter(o => o.parentOrderId === selected.value?.id));
 const adjustmentDelta = computed(() => Math.round((op.adjustmentAmount || 0) * 100) * (op.adjustmentDirection === 'decrease' ? -1 : 1));
 const adjustmentTarget = computed(() => selected.value?.payment ? Math.abs(adjustmentDelta.value) : op.totalCents + adjustmentDelta.value);

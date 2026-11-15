@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { isAdminRole } from '../../shared/roles';
 import { computed, reactive, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { ElMessage } from 'element-plus';
@@ -21,7 +22,7 @@ const detailTab = ref('capabilities');
 const busy = ref(false);
 const editing = ref<Player | null>(null);
 const form = reactive({ name: '', contactType: '微信', contact: '', gender: '男', status: 'available' as Player['status'], capabilities: [{ mode: '机密', tier: '娱乐陪' }] as Capability[], notes: '' });
-const isAdmin = computed(() => state.user?.role === 'admin');
+const isAdmin = computed(() => isAdminRole(state.user?.role));
 const selected = computed(() => state.players.find(p => p.id === detailId.value));
 const availableCount = computed(() => state.players.filter(p => p.status === 'available').length);
 const servingCount = computed(() => new Set(state.orders.flatMap(o => o.assignments.filter(a => a.status === 'serving').map(a => a.playerId))).size);

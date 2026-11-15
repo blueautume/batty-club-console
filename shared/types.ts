@@ -1,9 +1,9 @@
-export type Role = 'admin' | 'staff';
+export type Role = 'root' | 'admin' | 'staff' | 'shareholder';
 export type Permission = 'recharge' | 'payment' | 'refund' | 'export' | 'players';
 export type Mode = '机密' | '绝密';
 export type Tier = '娱乐陪' | '技术陪' | '高阶陪' | '明星陪' | '本月置顶明星';
 export type Membership = '普通客户' | '白银' | '黄金' | '铂金' | '钻石' | '红卡';
-export interface User { id: string; username: string; name: string; role: Role; permissions: Permission[]; active: boolean; mustChangePassword?: boolean; lastLogin?: string; }
+export interface User { id: string; username: string; name: string; role: Role; permissions: Permission[]; active: boolean; canManageAdmins?: boolean; mustChangePassword?: boolean; lastLogin?: string; }
 export interface Customer { id: string; code: string; name: string; contactType: string; contact: string; source: string; tags: string[]; notes: string; balanceCents: number; member: Membership; benefit: 'discount' | 'wechat' | 'none'; wechatUsed: number; groupInvited: boolean; ownerId: string; createdBy: string; createdAt: string; updatedAt: string; active: boolean; version: number; }
 export interface Capability { mode: Mode; tier: Tier; }
 export interface Player { id: string; code: string; name: string; contactType: string; contact: string; gender: string; status: 'available' | 'resting' | 'disabled'; capabilities: Capability[]; notes: string; createdAt: string; updatedAt: string; version: number; }
@@ -24,3 +24,12 @@ export interface AuditEntry { id: string; actorId: string; actorName: string; ac
 export interface Settings { prices: Record<string, Record<string, number>>; pairDiscounts: Record<string, number>; femaleHourlyCents: number; extraCustomerHourlyCents: number; sixHourRate: number; members: Record<string, { initialCents: number; renewalCents: number; rate: number; wechatLimit: number }>; clubName: string; }
 export interface Dashboard { customers: number; players: number; pendingPayment: number; pendingDispatch: number; serving: number; completed: number; orderTotalCents: number; rechargeCents: number; externalOrderCents: number; walletConsumedCents: number; refundCents: number; externalRefundCents: number; cashReceivedCents: number; walletLiabilityCents: number; earningsCents: number; daily: { date: string; amountCents: number; count: number }[]; }
 export interface Bootstrap { demoMode?: boolean; user: User; customers: Customer[]; players: Player[]; orders: Order[]; ledger: LedgerEntry[]; recharges: Recharge[]; audit: AuditEntry[]; staff: Pick<User, 'id' | 'name'>[]; accounts: User[]; settings: Settings; dashboard: Dashboard; }
+export type ReportOrder = Pick<Order, 'id' | 'code' | 'kind' | 'customerName' | 'totalCents' | 'status' | 'createdByName' | 'createdAt'> & {
+  items: Pick<PricedItem, 'id' | 'mode' | 'tier' | 'hours'>[];
+  payment?: Pick<Payment, 'walletCents' | 'externalCents' | 'createdAt'>;
+  refunds: Pick<Refund, 'walletCents' | 'externalCents' | 'createdAt'>[];
+  assignments: Pick<Assignment, 'id' | 'itemId' | 'playerName' | 'status' | 'assignedAt' | 'freeMinutes' | 'earningCents' | 'settled'>[];
+};
+export type ReportRecharge = Pick<Recharge, 'id' | 'customerName' | 'amountCents' | 'kind' | 'member' | 'channel' | 'reference' | 'actorName' | 'createdAt' | 'reversed'>;
+export type ReportLedgerEntry = Pick<LedgerEntry, 'id' | 'customerName' | 'type' | 'amountCents' | 'balanceAfterCents' | 'actorName' | 'createdAt'>;
+export interface ReportsData { orders: ReportOrder[]; recharges: ReportRecharge[]; ledger: ReportLedgerEntry[]; walletLiabilityCents: number; }

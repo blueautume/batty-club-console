@@ -33,7 +33,7 @@ describe('真实后端关键业务流程', { concurrency: false }, () => {
       assert.equal((await f.request('/api/bootstrap')).status, 401);
       assert.equal((await f.request('/api/login', { username: 'admin', password: 'Batty2026!' }, 'POST', { Origin: 'https://untrusted.example' })).status, 403);
       const login = await f.login(); assert.match(login.headers.get('set-cookie')!, /HttpOnly/); assert.match(login.headers.get('set-cookie')!, /SameSite=Strict/);
-      const state = await f.bootstrap(); assert.equal(state.user.role, 'admin'); assert.ok(!JSON.stringify(state).includes('passwordHash')); assert.ok(!JSON.stringify(state).includes('Batty2026!'));
+      const state = await f.bootstrap(); assert.equal(state.user.role, 'root'); assert.ok(!JSON.stringify(state).includes('passwordHash')); assert.ok(!JSON.stringify(state).includes('Batty2026!'));
       assert.equal((await f.request('/api/logout', {})).status, 200); assert.equal((await f.request('/api/bootstrap')).status, 401);
     } finally { await f.close(); }
   });
@@ -122,7 +122,7 @@ describe('真实后端关键业务流程', { concurrency: false }, () => {
       const cookie = (await f.login('limited', 'Limited2026!')).headers.get('set-cookie')!.split(';')[0];
       await f.login(); assert.equal((await f.request(`/api/accounts/${created.data.id}`, { active: false }, 'PUT')).status, 200);
       assert.equal((await fetch(f.base + '/api/bootstrap', { headers: { Cookie: cookie } })).status, 401);
-      assert.equal((await f.request('/api/accounts/admin', { active: false }, 'PUT')).status, 400);
+      assert.equal((await f.request('/api/accounts/admin', { active: false }, 'PUT')).status, 403);
     } finally { await f.close(); }
   });
   it('退款不能超原来源金额，导出与一致备份可以下载', async () => {

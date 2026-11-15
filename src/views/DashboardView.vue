@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { isAdminRole } from '../../shared/roles';
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { Plus, ArrowRight, Refresh, Clock, User, Tickets, Headset, Wallet, TrendCharts } from '@element-plus/icons-vue';
@@ -56,7 +57,7 @@ const cards = computed(() => [
       <div class="head-actions"><el-button :icon="Refresh" :loading="loading" @click="reload">刷新</el-button><el-button type="primary" :icon="Plus" @click="router.push('/quotes')">新建报价</el-button></div>
     </div>
     <section class="welcome">
-      <div class="welcome-main"><span class="welcome-eyebrow">BATTY CLUB · 贝蒂电竞</span><h2>{{ greeting }}，{{ state.user?.name || '伙伴' }} <span>✦</span></h2><p>今天已新增 <strong>{{ todayOrders.length }}</strong> 笔订单。把报价、收款记录和派单安排好，开始今天的工作吧。</p><div class="welcome-date">{{ dateText }} <span>{{ state.user?.role === 'admin' ? '管理员工作空间' : '客服工作空间' }}</span></div></div>
+      <div class="welcome-main"><span class="welcome-eyebrow">BATTY CLUB · 贝蒂电竞</span><h2>{{ greeting }}，{{ state.user?.name || '伙伴' }} <span>✦</span></h2><p>今天已新增 <strong>{{ todayOrders.length }}</strong> 笔订单。把报价、收款记录和派单安排好，开始今天的工作吧。</p><div class="welcome-date">{{ dateText }} <span>{{ isAdminRole(state.user?.role) ? '管理员工作空间' : '客服工作空间' }}</span></div></div>
       <div class="welcome-art" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="art-card"><el-icon :size="30"><Headset /></el-icon><span>PLAY TOGETHER</span><b>好服务，有陪伴</b><div class="art-dots"><i></i><i></i><i></i><i></i></div></div><span class="spark spark-one">✦</span><span class="spark spark-two">✧</span></div>
     </section>
     <div class="stats-grid">

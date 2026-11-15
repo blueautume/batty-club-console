@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { isAdminRole } from '../../shared/roles';
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue';
 import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
@@ -45,7 +46,7 @@ const walletRefundSources = computed(() => state.recharges.filter(r => r.custome
 const dateRange = ref<string[]>([]);
 const ledgerSearch = ref('');
 const ledgerType = ref('');
-const isAdmin = computed(() => state.user?.role === 'admin');
+const isAdmin = computed(() => isAdminRole(state.user?.role));
 const selected = computed(() => state.customers.find(c => c.id === detailId.value));
 const rechargeCustomer = computed(() => state.customers.find(c => c.id === rechargeCustomerId.value));
 const memberCount = computed(() => state.customers.filter(c => c.member !== '普通客户').length);

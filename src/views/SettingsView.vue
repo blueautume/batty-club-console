@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { isAdminRole } from '../../shared/roles';
 import { computed, reactive, ref, watch } from 'vue';
 import { ElMessage } from 'element-plus';
 import { Check, RefreshLeft, Download, PriceTag, DocumentChecked, Lock, Coin } from '@element-plus/icons-vue';
@@ -58,7 +59,7 @@ const downloadBackup = async () => {
 </script>
 
 <template>
-  <div v-if="state.user?.role === 'admin'">
+  <div v-if="isAdminRole(state.user?.role)">
     <div class="page-head"><div><h1 class="page-title">基础设置</h1><p class="page-subtitle">统一价目、会员套餐与已确认的业务规则。</p></div><div class="head-actions"><el-button :icon="RefreshLeft" @click="reset">恢复当前配置</el-button><el-button type="primary" :icon="Check" :loading="saving" @click="save">保存配置</el-button></div></div>
     <div class="settings-layout"><main class="settings-main">
       <section class="panel settings-panel"><div class="setting-title"><span class="title-icon"><el-icon><PriceTag /></el-icon></span><div><h3>基础价目表</h3><p>单位：元 / 位 / 小时。价格调整仅用于新报价。</p></div></div><el-form label-position="top"><el-form-item label="俱乐部名称"><el-input v-model="form.clubName" maxlength="60" style="max-width:360px" @input="markDirty" /></el-form-item></el-form><el-table :data="priceRows" class="price-table"><el-table-column prop="tier" label="服务档位" min-width="150" /><el-table-column v-for="mode in modes" :key="mode" :label="mode + '（元 / 小时）'" min-width="180"><template #default="{ row }"><el-input-number v-if="form.prices[mode]" v-model="form.prices[mode]![row.tier]" :min="0" :max="100000" :precision="2" :step="10" controls-position="right" @change="markDirty" /></template></el-table-column><el-table-column label="双陪整组减免 / 小时" min-width="190"><template #default="{ row }"><el-input-number v-model="form.pairDiscounts[row.tier]" :min="0" :max="100000" :precision="2" :step="5" controls-position="right" @change="markDirty" /></template></el-table-column></el-table><p class="field-note">同档双陪按整组减免一次。混档由客服明确填写整组减免金额，娱乐陪与技术陪可以组合报价。</p></section>

@@ -8,7 +8,8 @@ import os from 'node:os';
 import ExcelJS from 'exceljs';
 import { z } from 'zod';
 import { defaultSettings, priceQuote } from '../shared/pricing.ts';
-import type { User, Customer, Player, Order, Assignment, Recharge, LedgerEntry, AuditEntry, Settings, Dashboard, Permission, QuoteItemInput, Membership, Bootstrap, QuoteDraft, QuoteDraftPayload } from '../shared/types.ts';
+import { canManageAdminAccounts, isAdminRole } from '../shared/roles.ts';
+import type { User, Customer, Player, Order, Assignment, Recharge, LedgerEntry, AuditEntry, Settings, Dashboard, Permission, QuoteItemInput, Membership, Bootstrap, QuoteDraft, QuoteDraftPayload, ReportsData, Role } from '../shared/types.ts';
 
 const permissions = ['recharge', 'payment', 'refund', 'export', 'players'] as const;
 const memberships = ['普通客户', '白银', '黄金', '铂金', '钻石', '红卡'] as const;
@@ -29,7 +30,7 @@ type WalletRefund = { id: string; customerId: string; customerName: string; amou
 type AuthedRequest = Request & { actor: User; sessionHash: string };
 class HttpError extends Error { status: number; constructor(status: number, message: string) { super(message); this.status = status; } }
 function fail(status: number, message: string): never { throw new HttpError(status, message); }
-function safeUser(user: StoredUser): User { const { passwordHash, ...safe } = user; return safe; }
+function safeUser(user: StoredUser): User { const { passwordHash, ...safe } = user; return { ...safe, canManageAdmins: user.role === 'root' || user.role === 'admin' && user.canManageAdmins === true }; }
 function hashPassword(password: string): string { const salt = randomBytes(16).toString('hex'); return `${salt}:${scryptSync(password, salt, 64).toString('hex')}`; }
 function verifyPassword(password: string, stored: string): boolean { const [salt, hash] = stored.split(':'); if (!salt || !hash) return false; const candidate = scryptSync(password, salt, 64); const actual = Buffer.from(hash, 'hex'); return actual.length === candidate.length && timingSafeEqual(candidate, actual); }
 function tokenHash(token: string) { return createHash('sha256').update(token).digest('hex'); }
@@ -100,8 +101,14 @@ export function createApp(options: AppOptions = {}) {
     const record: AuditEntry = { id: id(), actorId: actor?.id || '', actorName: actor?.name || '未登录', action, targetType, targetId, targetName, before: before as AuditEntry['before'], after: after as AuditEntry['after'], reason, result, ip: req?.ip || req?.socket.remoteAddress || 'local', createdAt: now() };
     put('audit', record);
   };
-  const has = (user: User, permission: Permission) => user.role === 'admin' || user.permissions.includes(permission);
-  const assertAdmin = (req: Request) => { if ((req as unknown as AuthedRequest).actor.role !== 'admin') { audit(req, '权限拒绝', 'permission', '', '管理员权限', null, null, '', 'denied'); fail(403, '此操作需要管理员权限'); } };
+  const has = (user: User, permission: Permission) => isAdminRole(user.role) || user.role === 'staff' && user.permissions.includes(permission);
+  const assertAdmin = (req: Request) => { if (!isAdminRole((req as unknown as AuthedRequest).actor.role)) { audit(req, '权限拒绝', 'permission', '', '管理员权限', null, null, '', 'denied'); fail(403, '此操作需要管理员权限'); } };
+  const assertAccountTarget = (req: Request, role: Role) => {
+    assertAdmin(req);
+    const actor = (req as unknown as AuthedRequest).actor;
+    if (role === 'root') { audit(req, '权限拒绝', 'permission', '', 'root账号保护', null, null, 'root账号不可经账号管理修改', 'denied'); fail(403, 'root账号受保护，请使用个人菜单修改自己的密码'); }
+    if (role === 'admin' && !canManageAdminAccounts(actor)) { audit(req, '权限拒绝', 'permission', '', '管理员账号管理', null, null, '', 'denied'); fail(403, '管理其他管理员账号需要root授权'); }
+  };
   const assertPermission = (req: Request, permission: Permission) => { if (!has((req as unknown as AuthedRequest).actor, permission)) { audit(req, '权限拒绝', 'permission', permission, permission, null, null, '', 'denied'); fail(403, '当前账号未获此操作授权'); } };
   const requireReason = (value: unknown) => requiredText(1000).parse(value);
   const checkVersion = (old: { version: number }, supplied: unknown) => { if (supplied !== old.version) fail(409, '此记录已被其他工作人员修改，请刷新后再操作'); };
@@ -131,7 +138,7 @@ export function createApp(options: AppOptions = {}) {
     put('quoteDrafts', draft);
     audit(req, '草稿生成订单', 'quoteDraft', draft.id, draft.title, before, draftSummary(draft), `关联订单：${order.code}`);
   };
-  const owner = (ownerId: string, fallback: string) => { const chosen = ownerId || fallback; const user = get<StoredUser>('users', chosen); if (!user.active) fail(400, '跟进客服账号已停用'); return chosen; };
+  const owner = (ownerId: string, fallback: string) => { const chosen = ownerId || fallback; const user = get<StoredUser>('users', chosen); if (!user.active) fail(400, '跟进客服账号已停用'); if (user.role === 'shareholder') fail(400, '股东账号不能作为业务跟进人'); return chosen; };
   const claimReceipt = (channel: string, reference: string, entityId: string) => { if (!reference.trim()) fail(400, '请填写外部转账参考号或凭证编号'); if (db.prepare('SELECT entity_id FROM receipt_refs WHERE channel=? AND reference=?').get(channel.trim(), reference.trim())) fail(409, '同一转账参考号已登记，请核对充值或订单记录'); db.prepare('INSERT INTO receipt_refs VALUES(?,?,?)').run(channel.trim(), reference.trim(), entityId); };
   const claimExternalRefund = (reference: string, entityId: string) => { if (!reference.trim()) fail(400, '请填写实际外部退款参考号或凭证编号'); if (db.prepare('SELECT entity_id FROM external_refund_refs WHERE reference=?').get(reference.trim())) fail(409, '此实际退款参考号已经登记，不能重复记账'); db.prepare('INSERT INTO external_refund_refs VALUES(?,?)').run(reference.trim(), entityId); };
   const claimRefundOperation = (key: string, targetId: string) => { const operationId = `refund:${key}`; if (maybe('operations', operationId)) fail(409, '这次退款已经登记，请刷新查看原记录，不能重复提交'); put('operations', { id: operationId, targetId, createdAt: now() }); };
@@ -168,7 +175,7 @@ export function createApp(options: AppOptions = {}) {
   function seed() {
     if (list<User>('users').length) return;
     tx(() => {
-      const admin: StoredUser = { id: 'admin', username: 'admin', name: '俱乐部管理员', role: 'admin', permissions: [...permissions], active: true, passwordHash: hashPassword(process.env.ADMIN_INITIAL_PASSWORD || 'Batty2026!'), mustChangePassword: false };
+      const admin: StoredUser = { id: 'admin', username: 'admin', name: '俱乐部管理员', role: 'root', canManageAdmins: true, permissions: [...permissions], active: true, passwordHash: hashPassword(process.env.ADMIN_INITIAL_PASSWORD || 'Batty2026!'), mustChangePassword: false };
       const staff: StoredUser = { id: 'staff-demo', username: 'kefu', name: '客服小贝', role: 'staff', permissions: [...permissions], active: true, passwordHash: hashPassword(process.env.STAFF_INITIAL_PASSWORD || 'Staff2026!'), mustChangePassword: false };
       put('users', admin); put('users', staff); put('settings', { id: 'main', value: clone(defaultSettings) });
       const demoCustomers = [
@@ -219,13 +226,37 @@ export function createApp(options: AppOptions = {}) {
       throw new Error('正式空库需要两个不同账号及独立初始密码：ADMIN_INITIAL_PASSWORD、STAFF_INITIAL_PASSWORD 各至少16位并含字母与数字；可配置 ADMIN_INITIAL_USERNAME、STAFF_INITIAL_USERNAME');
     }
     tx(() => {
-      const admin: StoredUser = { id: 'admin', username: adminUsername.data, name: '管理员', role: 'admin', permissions: [...permissions], active: true, passwordHash: hashPassword(adminPassword.data), mustChangePassword: false };
+      const admin: StoredUser = { id: 'admin', username: adminUsername.data, name: '管理员', role: 'root', canManageAdmins: true, permissions: [...permissions], active: true, passwordHash: hashPassword(adminPassword.data), mustChangePassword: false };
       const staff: StoredUser = { id: 'staff-main', username: staffUsername.data, name: '客服', role: 'staff', permissions: [...permissions], active: true, passwordHash: hashPassword(staffPassword.data), mustChangePassword: false };
       put('users', admin); put('users', staff); put('settings', { id: 'main', value: clone(defaultSettings) });
       db.prepare('INSERT INTO counters(name,value) VALUES(?,1)').run('batty:production');
     });
   }
-  try { if (options.seed !== false) { if (production) initializeProduction(); else seed(); } }
+  function initializeRoot() {
+    tx(() => {
+      const users = list<StoredUser>('users');
+      const roots = users.filter(user => user.role === 'root');
+      if (roots.length > 1 || roots.some(user => !user.active)) throw new Error('数据库中的root账号状态异常，请先核对账号，系统不会自动覆盖');
+      if (users.length && !roots.length) {
+        const original = users.find(user => user.id === 'admin' && user.role === 'admin' && user.active);
+        if (!original) throw new Error('无法确定原始管理员，请先核对内置管理员账号，系统不会自动指定root');
+        const before = safeUser(original);
+        original.role = 'root'; original.canManageAdmins = true;
+        put('users', original);
+        db.prepare('DELETE FROM sessions WHERE user_id=?').run(original.id);
+        audit(null, '升级系统账号身份', 'account', original.id, original.name, before, safeUser(original), '原始管理员升级为唯一root，账号及历史记录保留', 'success', original);
+      }
+      db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS batty_single_root ON entities(json_extract(payload, '$.role')) WHERE kind='users' AND json_extract(payload, '$.role')='root';
+        CREATE TRIGGER IF NOT EXISTS batty_protect_root_delete BEFORE DELETE ON entities
+        WHEN OLD.kind='users' AND json_extract(OLD.payload, '$.role')='root'
+        BEGIN SELECT RAISE(ABORT, 'root账号不可删除'); END;
+        CREATE TRIGGER IF NOT EXISTS batty_protect_root_update BEFORE UPDATE ON entities
+        WHEN OLD.kind='users' AND json_extract(OLD.payload, '$.role')='root' AND
+          (NEW.kind IS NOT OLD.kind OR NEW.id IS NOT OLD.id OR json_extract(NEW.payload, '$.id') IS NOT json_extract(OLD.payload, '$.id') OR json_extract(NEW.payload, '$.role') IS NOT 'root' OR json_extract(NEW.payload, '$.active') IS NOT 1)
+        BEGIN SELECT RAISE(ABORT, 'root账号不可停用、降级或替换身份'); END;`);
+    });
+  }
+  try { if (options.seed !== false) { if (production) initializeProduction(); else seed(); } initializeRoot(); }
   catch (error) { db.close(); throw error; }
 
   app.use('/api', (req, _res, next) => {
@@ -269,6 +300,13 @@ export function createApp(options: AppOptions = {}) {
       if (!user?.active) fail(401, '账号已停用，请联系管理员');
       (req as unknown as AuthedRequest).actor = safeUser(user); (req as unknown as AuthedRequest).sessionHash = hash; next();
     } catch (error) { next(error); }
+  });
+  app.use('/api', (req, _res, next) => {
+    if ((req as unknown as AuthedRequest).actor.role !== 'shareholder') return next();
+    const readable = ['GET', 'HEAD'].includes(req.method) && ['/me', '/bootstrap', '/reports'].includes(req.path);
+    const personal = req.method === 'POST' && ['/logout', '/password'].includes(req.path);
+    if (!readable && !personal) return next(new HttpError(403, '股东账号仅可查看数据报表'));
+    next();
   });
   app.use('/api', (req, res, next) => {
     if ((req as unknown as AuthedRequest).actor.role === 'staff') {
@@ -359,11 +397,35 @@ export function createApp(options: AppOptions = {}) {
   }
   app.get('/api/bootstrap', (req, res) => {
     const actor = (req as unknown as AuthedRequest).actor;
+    if (actor.role === 'shareholder') {
+      const payload: Bootstrap = { demoMode: !production, user: actor, customers: [], players: [], orders: [], recharges: [], ledger: [], audit: [], staff: [], accounts: [], settings: clone(defaultSettings), dashboard: dashboard([], [], [], []) };
+      // Account bootstrap deliberately contains no raw business records for shareholders.
+      payload.dashboard.refundCents = 0; payload.dashboard.externalRefundCents = 0; payload.dashboard.cashReceivedCents = 0;
+      res.json(payload); return;
+    }
     const customers = list<Customer>('customers'); const players = list<Player>('players'); const orders = list<Order>('orders'); const recharges = list<Recharge>('recharges');
     const totals = dashboard(orders, customers, players, recharges);
-    const safeOrders = actor.role === 'admin' ? orders : orders.map(o => ({ ...o, assignments: o.assignments.map(a => ({ ...a, earningCents: 0, settled: false })) }));
-    if (actor.role !== 'admin') totals.earningsCents = 0;
-    const payload: Bootstrap = { demoMode: !production, user: actor, customers, players, orders: safeOrders, recharges, ledger: list<LedgerEntry>('ledger'), audit: actor.role === 'admin' ? list<AuditEntry>('audit').slice(0, 2000) : list<AuditEntry>('audit').filter(a => !['account', 'settings', 'permission', 'export', 'system'].includes(a.targetType) && (a.targetType !== 'quoteDraft' || a.actorId === actor.id)).map(a => ({ ...a, ip: '' })).slice(0, 1000), staff: list<StoredUser>('users').filter(u => u.active).map(u => ({ id: u.id, name: u.name })), accounts: actor.role === 'admin' ? list<StoredUser>('users').map(safeUser) : [], settings: settings(), dashboard: totals };
+    const safeOrders = isAdminRole(actor.role) ? orders : orders.map(o => ({ ...o, assignments: o.assignments.map(a => ({ ...a, earningCents: 0, settled: false })) }));
+    if (!isAdminRole(actor.role)) totals.earningsCents = 0;
+    const payload: Bootstrap = { demoMode: !production, user: actor, customers, players, orders: safeOrders, recharges, ledger: list<LedgerEntry>('ledger'), audit: isAdminRole(actor.role) ? list<AuditEntry>('audit').slice(0, 2000) : list<AuditEntry>('audit').filter(a => !['account', 'settings', 'permission', 'export', 'system'].includes(a.targetType) && (a.targetType !== 'quoteDraft' || a.actorId === actor.id)).map(a => ({ ...a, ip: '' })).slice(0, 1000), staff: list<StoredUser>('users').filter(u => u.active && u.role !== 'shareholder').map(u => ({ id: u.id, name: u.name })), accounts: isAdminRole(actor.role) ? list<StoredUser>('users').map(safeUser) : [], settings: settings(), dashboard: totals };
+    res.json(payload);
+  });
+
+  app.get('/api/reports', (req, res) => {
+    const actor = (req as unknown as AuthedRequest).actor;
+    const financialDetails = actor.role !== 'staff';
+    const payload: ReportsData = {
+      orders: list<Order>('orders').map(order => ({
+        id: order.id, code: order.code, kind: order.kind, customerName: order.customerName, totalCents: order.totalCents, status: order.status, createdByName: order.createdByName, createdAt: order.createdAt,
+        items: order.items.map(item => ({ id: item.id, mode: item.mode, tier: item.tier, hours: item.hours })),
+        ...(order.payment ? { payment: { walletCents: order.payment.walletCents, externalCents: order.payment.externalCents, createdAt: order.payment.createdAt } } : {}),
+        refunds: order.refunds.map(refund => ({ walletCents: refund.walletCents, externalCents: refund.externalCents, createdAt: refund.createdAt })),
+        assignments: order.assignments.map(assignment => ({ id: assignment.id, itemId: assignment.itemId, playerName: assignment.playerName, status: assignment.status, assignedAt: assignment.assignedAt, freeMinutes: assignment.freeMinutes, earningCents: financialDetails ? assignment.earningCents : 0, settled: financialDetails && assignment.settled }))
+      })),
+      recharges: list<Recharge>('recharges').map(recharge => ({ id: recharge.id, customerName: recharge.customerName, amountCents: recharge.amountCents, kind: recharge.kind, member: recharge.member, channel: recharge.channel, reference: recharge.reference, actorName: recharge.actorName, createdAt: recharge.createdAt, reversed: recharge.reversed })),
+      ledger: list<LedgerEntry>('ledger').map(entry => ({ id: entry.id, customerName: entry.customerName, type: entry.type, amountCents: entry.amountCents, balanceAfterCents: entry.balanceAfterCents, actorName: entry.actorName, createdAt: entry.createdAt })),
+      walletLiabilityCents: list<Customer>('customers').reduce((sum, customer) => sum + customer.balanceCents, 0)
+    };
     res.json(payload);
   });
 
@@ -424,7 +486,7 @@ export function createApp(options: AppOptions = {}) {
       } else if (body.kind === 'renewal' || body.kind === 'initial') {
         if (body.member !== '普通客户' && body.member !== customer.member) fail(400, '续充不会自动升级，请选择升级套餐');
         const minimum = cfg.members[customer.member]?.renewalCents || 0;
-        if (body.amountCents < minimum) { if (actor.role !== 'admin' || !body.exceptionReason?.trim()) fail(400, `未达到最低续充金额￥${(minimum / 100).toFixed(2)}，例外需管理员填写原因`); }
+        if (body.amountCents < minimum) { if (!isAdminRole(actor.role) || !body.exceptionReason?.trim()) fail(400, `未达到最低续充金额￥${(minimum / 100).toFixed(2)}，例外需管理员填写原因`); }
       }
       if (['白银', '黄金'].includes(nextMember) && !['discount', 'wechat'].includes(nextBenefit)) fail(400, '开通会员时必须选择折扣或微信权益');
       const recharge: Recharge = { id: id(), customerId: customer.id, customerName: customer.name, amountCents: body.amountCents, kind: body.kind, member: nextMember, benefit: nextBenefit, channel: body.channel, reference: body.reference, note: [body.note, body.exceptionReason ? `例外：${body.exceptionReason}` : ''].filter(Boolean).join('；'), actorName: actor.name, createdAt: now(), reversed: false };
@@ -492,7 +554,7 @@ export function createApp(options: AppOptions = {}) {
       return order;
     }); res.json(result);
   });
-  app.get('/api/orders/:id', (req, res) => { const order = get<Order>('orders', String(req.params.id)); if ((req as unknown as AuthedRequest).actor.role !== 'admin') order.assignments = order.assignments.map(a => ({ ...a, earningCents: 0, settled: false })); res.json(order); });
+  app.get('/api/orders/:id', (req, res) => { const order = get<Order>('orders', String(req.params.id)); if (!isAdminRole((req as unknown as AuthedRequest).actor.role)) order.assignments = order.assignments.map(a => ({ ...a, earningCents: 0, settled: false })); res.json(order); });
   app.post('/api/orders/:id/adjustment', (req, res) => {
     assertAdmin(req); const body = orderAdjustmentSchema.parse(req.body), targetId = String(req.params.id);
     const result = tx(() => {
@@ -594,7 +656,7 @@ export function createApp(options: AppOptions = {}) {
       const refunded = sumsRefund(order); if (body.walletCents > order.payment.walletCents - refunded.wallet || body.externalCents > order.payment.externalCents - refunded.external) fail(400, '退款金额超过对应付款来源的剩余可退金额');
       const unstartedCents = order.items.filter(item => !order.assignments.some(a => a.itemId === item.id && a.startedAt)).reduce((sum, item) => sum + item.totalCents, 0);
       const staffRefundLimitCents = Math.max(0, unstartedCents + Math.min(0, order.adjustmentCents) - refunded.wallet - refunded.external);
-      if ((req as unknown as AuthedRequest).actor.role !== 'admin' && body.walletCents + body.externalCents > staffRefundLimitCents) fail(403, '退款超出未开始服务部分的可退金额，已消费服务退费需管理员处理');
+      if (!isAdminRole((req as unknown as AuthedRequest).actor.role) && body.walletCents + body.externalCents > staffRefundLimitCents) fail(403, '退款超出未开始服务部分的可退金额，已消费服务退费需管理员处理');
       if (body.externalCents > 0 && !body.reference) fail(400, '外部退款请填写实际退款参考号或凭证编号');
       const actor = (req as unknown as AuthedRequest).actor;
       const refund = { id: id(), walletCents: body.walletCents, externalCents: body.externalCents, reason: body.reason, reference: body.reference, actorId: actor.id, actorName: actor.name, createdAt: now() };
@@ -623,12 +685,37 @@ export function createApp(options: AppOptions = {}) {
   app.post('/api/orders/:id/owner', (req, res) => { const body = z.object({ ownerId: requiredText(80), reason: requiredText(1000) }).parse(req.body); const result = tx(() => { const order = get<Order>('orders', String(req.params.id)); const oldOwner = order.ownerId; order.ownerId = owner(body.ownerId, oldOwner); saveOrder(order); audit(req, '交接订单跟进人', 'order', order.id, order.code, { ownerId: oldOwner }, { ownerId: order.ownerId }, body.reason); return order; }); res.json(result); });
 
   app.post('/api/accounts', (req, res) => {
-    assertAdmin(req); const body = z.object({ username: z.string().trim().min(3).max(40).regex(/^[a-zA-Z0-9_.-]+$/, '登录名仅支持字母、数字、下划线和短横线'), name: requiredText(60), password: passwordSchema, role: z.enum(['admin', 'staff']), permissions: z.array(z.enum(permissions)).default([]), active: z.boolean().default(true) }).parse(req.body);
-    const result = tx(() => { if (list<StoredUser>('users').some(u => u.username.toLowerCase() === body.username.toLowerCase())) fail(409, '此登录名已经存在'); const user: StoredUser = { id: id(), username: body.username, name: body.name, role: body.role, permissions: body.role === 'admin' ? [...permissions] : body.permissions, active: body.active, passwordHash: hashPassword(body.password), mustChangePassword: true }; put('users', user); audit(req, '创建工作人员账号', 'account', user.id, user.name, null, safeUser(user)); return safeUser(user); }); res.status(201).json(result);
+    assertAdmin(req);
+    const body = z.object({ username: z.string().trim().min(3).max(40).regex(/^[a-zA-Z0-9_.-]+$/, '登录名仅支持字母、数字、下划线和短横线'), name: requiredText(60), password: passwordSchema, role: z.enum(['admin', 'staff', 'shareholder']), permissions: z.array(z.enum(permissions)).default([]), active: z.boolean().default(true), canManageAdmins: z.boolean().default(false) }).parse(req.body);
+    assertAccountTarget(req, body.role);
+    const actor = (req as unknown as AuthedRequest).actor;
+    if (body.canManageAdmins && actor.role !== 'root') fail(403, '只有root可以授予管理员账号管理权限');
+    if (body.canManageAdmins && body.role !== 'admin') fail(400, '此授权仅适用于普通管理员');
+    const result = tx(() => {
+      if (list<StoredUser>('users').some(u => u.username.toLowerCase() === body.username.toLowerCase())) fail(409, '此登录名已经存在');
+      const user: StoredUser = { id: id(), username: body.username, name: body.name, role: body.role, permissions: body.role === 'admin' ? [...permissions] : body.role === 'shareholder' ? [] : body.permissions, canManageAdmins: body.role === 'admin' && body.canManageAdmins, active: body.active, passwordHash: hashPassword(body.password), mustChangePassword: true };
+      put('users', user); audit(req, '创建工作人员账号', 'account', user.id, user.name, null, safeUser(user)); return safeUser(user);
+    }); res.status(201).json(result);
   });
   app.put('/api/accounts/:id', (req, res) => {
-    assertAdmin(req); const body = z.object({ name: requiredText(60).optional(), role: z.enum(['admin', 'staff']).optional(), permissions: z.array(z.enum(permissions)).optional(), active: z.boolean().optional(), password: passwordSchema.optional() }).parse(req.body);
-    const result = tx(() => { const user = get<StoredUser>('users', String(req.params.id)); const before = safeUser(user); if (user.role === 'admin' && user.active && (body.role === 'staff' || body.active === false) && list<StoredUser>('users').filter(u => u.role === 'admin' && u.active).length <= 1) fail(400, '必须至少保留一个启用的管理员账号'); Object.assign(user, body.name !== undefined ? { name: body.name } : {}, body.role ? { role: body.role } : {}, body.permissions ? { permissions: body.permissions } : {}, body.active !== undefined ? { active: body.active } : {}); if (user.role === 'admin') user.permissions = [...permissions]; if (body.password) { user.passwordHash = hashPassword(body.password); user.mustChangePassword = true; } put('users', user); db.prepare('DELETE FROM sessions WHERE user_id=?').run(user.id); audit(req, body.password ? '重置工作人员密码' : '调整工作人员授权', 'account', user.id, user.name, before, safeUser(user), body.password ? '密码已重置，原有登录全部失效' : '权限即时更新，原有登录全部失效'); return safeUser(user); }); res.json(result);
+    assertAdmin(req);
+    const result = tx(() => {
+      const user = get<StoredUser>('users', String(req.params.id));
+      assertAccountTarget(req, user.role);
+      const body = z.object({ name: requiredText(60).optional(), role: z.enum(['admin', 'staff', 'shareholder']).optional(), permissions: z.array(z.enum(permissions)).optional(), active: z.boolean().optional(), password: passwordSchema.optional(), canManageAdmins: z.boolean().optional() }).parse(req.body);
+      const nextRole = body.role ?? user.role;
+      assertAccountTarget(req, nextRole);
+      const actor = (req as unknown as AuthedRequest).actor;
+      const before = safeUser(user);
+      if (body.canManageAdmins !== undefined && body.canManageAdmins !== before.canManageAdmins && actor.role !== 'root') fail(403, '只有root可以调整管理员账号管理权限');
+      if (body.canManageAdmins && nextRole !== 'admin') fail(400, '此授权仅适用于普通管理员');
+      Object.assign(user, body.name !== undefined ? { name: body.name } : {}, { role: nextRole }, body.active !== undefined ? { active: body.active } : {});
+      user.permissions = nextRole === 'admin' ? [...permissions] : nextRole === 'shareholder' ? [] : body.permissions ?? (before.role === 'staff' ? user.permissions : []);
+      user.canManageAdmins = nextRole === 'admin' && (body.canManageAdmins ?? (before.role === 'admin' && before.canManageAdmins === true));
+      if (body.password) { user.passwordHash = hashPassword(body.password); user.mustChangePassword = true; }
+      put('users', user); db.prepare('DELETE FROM sessions WHERE user_id=?').run(user.id);
+      audit(req, body.password ? '重置工作人员密码' : '调整工作人员授权', 'account', user.id, user.name, before, safeUser(user), body.password ? '密码已重置，原有登录全部失效' : '权限即时更新，原有登录全部失效'); return safeUser(user);
+    }); res.json(result);
   });
   app.put('/api/settings', (req, res) => {
     assertAdmin(req); const reason = requireReason(req.body.reason); const candidate = (req.body.settings || req.body) as Settings;
@@ -651,7 +738,7 @@ export function createApp(options: AppOptions = {}) {
       else if (type === 'orders') { title = '订单汇总'; rows = dateFiltered(list<Order>('orders'), req).map(o => ({ 订单编号: o.code, 订单类型: o.kind === 'supplement' ? '特殊情况补款' : '服务订单', 关联原单: o.parentOrderId ? maybe<Order>('orders', o.parentOrderId)?.code || o.parentOrderId : '', 客户: o.customerName, 状态: o.status, 应付金额: o.totalCents / 100, 累计增减款: o.adjustmentCents / 100, 调整说明: o.adjustmentReason, 余额付款: (o.payment?.walletCents || 0) / 100, 外部到账: (o.payment?.externalCents || 0) / 100, 退款金额: (sumsRefund(o).wallet + sumsRefund(o).external) / 100, 创建客服: o.createdByName, 收款客服: o.payment?.actorName || '', 服务明细: o.kind === 'supplement' ? `特殊情况补款：${o.adjustmentReason}` : o.items.map(i => `${i.mode}/${i.tier}/${i.hours}小时`).join('；'), 创建时间: o.createdAt })); }
       else if (type === 'ledger') { title = '余额流水'; rows = dateFiltered(list<LedgerEntry>('ledger'), req).map(l => ({ 客户: l.customerName, 类型: l.type, 变动金额: l.amountCents / 100, 变动后余额: l.balanceAfterCents / 100, 关联订单: l.orderId, 经办人: l.actorName, 备注: l.note, 创建时间: l.createdAt })); }
       else if (type === 'recharges') { title = '充值记录'; rows = dateFiltered(list<Recharge>('recharges'), req).map(r => ({ 客户: r.customerName, 充值类型: r.kind, 金额: r.amountCents / 100, 会员: r.member, 渠道: r.channel, 凭证编号: r.reference, 已更正: r.reversed ? '是' : '否', 经办人: r.actorName, 备注: r.note, 创建时间: r.createdAt })); }
-      else if (type === 'assignments') { title = '派单与成员应得'; rows = list<Order>('orders').flatMap(o => dateFiltered(o.assignments.map(a => ({ ...a, createdAt: a.assignedAt })), req).map(a => ({ 订单编号: o.code, 客户: o.customerName, 陪玩: a.playerName, 模式: o.items.find(i => i.id === a.itemId)?.mode, 档位: o.items.find(i => i.id === a.itemId)?.tier, 状态: a.status, 派单时间: a.assignedAt, 开始: a.startedAt || '', 结束: a.endedAt || '', 免费分钟: a.freeMinutes, ...(actor.role === 'admin' ? { 应得金额: a.earningCents / 100, 已结算: a.settled ? '是' : '否' } : {}), 原因: a.reason || '' }))); }
+      else if (type === 'assignments') { title = '派单与成员应得'; rows = list<Order>('orders').flatMap(o => dateFiltered(o.assignments.map(a => ({ ...a, createdAt: a.assignedAt })), req).map(a => ({ 订单编号: o.code, 客户: o.customerName, 陪玩: a.playerName, 模式: o.items.find(i => i.id === a.itemId)?.mode, 档位: o.items.find(i => i.id === a.itemId)?.tier, 状态: a.status, 派单时间: a.assignedAt, 开始: a.startedAt || '', 结束: a.endedAt || '', 免费分钟: a.freeMinutes, ...(isAdminRole(actor.role) ? { 应得金额: a.earningCents / 100, 已结算: a.settled ? '是' : '否' } : {}), 原因: a.reason || '' }))); }
       else if (type === 'audit') {
         assertAdmin(req); title = '操作审计';
         const actorId = String(req.query.actorId || ''); const action = String(req.query.action || ''); const result = String(req.query.result || ''); const query = String(req.query.q || '').toLowerCase();
