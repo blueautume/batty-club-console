@@ -111,13 +111,30 @@ const isSpace = (value: string | undefined) => !!value && /^\s+$/u.test(value);
  * At exceptionally narrow widths, a prohibited punctuation boundary may be unavoidable.
  * Character preservation and fitting a line take priority; a single oversized grapheme
  * remains intact on its own line rather than splitting a combined emoji or accent.
+ * Monetary values and numeric factors stay atomic when they fit within a full line;
+ * an inherently oversized numeric token falls back to the same grapheme-safe rules.
  */
 export function wrapConfirmationText(text: string, maxWidth: number, measure: (value: string) => number): string[] {
   if (!(maxWidth > 0) || !Number.isFinite(maxWidth)) throw new Error('确认单文本排版宽度无效');
   const segmenter = new Intl.Segmenter('zh-CN', { granularity: 'grapheme' });
   const lines: string[] = [];
   for (const paragraph of text.replaceAll('\r\n', '\n').replaceAll('\r', '\n').split('\n')) {
-    const characters = [...segmenter.segment(paragraph)].map(({ segment }) => segment);
+    const graphemes = [...segmenter.segment(paragraph)];
+    const boundaries = new Set([...graphemes.map(value => value.index), paragraph.length]);
+    const numbers = new Map<number, string>();
+    const numberPattern = /(?:[+−-][ \t]*)?(?:[¥￥][ \t]*(?:[+−-][ \t]*)?)?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)[%％]?/gu;
+    for (const match of paragraph.matchAll(numberPattern)) {
+      if (boundaries.has(match.index) && boundaries.has(match.index + match[0].length) && measure(match[0]) <= maxWidth) numbers.set(match.index, match[0]);
+    }
+    const characters: string[] = [];
+    for (let index = 0; index < graphemes.length;) {
+      const current = graphemes[index]!, number = numbers.get(current.index);
+      if (number) {
+        characters.push(number);
+        const end = current.index + number.length;
+        while (index < graphemes.length && graphemes[index]!.index < end) index++;
+      } else { characters.push(current.segment); index++; }
+    }
     if (!characters.length) { lines.push(''); continue; }
     let start = 0;
     while (start < characters.length) {

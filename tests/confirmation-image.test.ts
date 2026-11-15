@@ -153,7 +153,7 @@ test('开放括号引号连同相邻空格移至下一行，不留在自动换�
 test('字素与空格位于标点断行边界时仍完整保留，组合emoji不被拆开', () => {
   const count = (value: string) => segments(value).length;
   const family = '👨‍👩‍👧‍👦';
-  for (const value of [`甲乙${family}。`, '甲乙e\u0301。']) {
+  for (const value of [`甲乙${family}。`, '甲乙e\u0301。', '甲乙1️⃣。', '甲乙1\u0301。']) {
     const lines = wrapConfirmationText(value, 3, count);
     assert.equal(lines.join(''), value); assert.equal(lines.length, 2);
     assert.ok(lines.every(line => count(line) <= 3)); assert.ok(lines[1].endsWith('。'));
@@ -171,6 +171,56 @@ test('中文禁则不改写用户显式换行，极窄行宽优先保留字符�
   const lines = wrapConfirmationText('甲。', 1, count);
   assert.deepEqual(lines, ['甲', '。']); assert.equal(lines.join(''), '甲。');
   assert.ok(lines.every(line => count(line) <= 1));
+});
+
+test('费用公式中的完整金额与折扣系数能放下一行时保持原子，不拆小数部分', () => {
+  const count = (value: string) => segments(value).length;
+  const value = '单项报价 ¥553.00 + ¥2295.00 × 0.85 = ¥2420.80';
+  const lines = wrapConfirmationText(value, 12, count);
+  assert.equal(lines.join(''), value); assert.ok(lines.every(line => count(line) <= 12));
+  for (const token of ['¥553.00', '¥2295.00', '0.85', '¥2420.80']) {
+    assert.ok(lines.some(line => line.includes(token)), `${token}必须在某一行完整出现`);
+  }
+  assert.deepEqual(wrapConfirmationText('甲¥553.00', 7, count), ['甲', '¥553.00']);
+  assert.deepEqual(wrapConfirmationText('折扣0.85', 4, count), ['折扣', '0.85']);
+  const font = '650 21px sans-serif';
+  const realValue = '本项计算式：¥2295.00 × 0.85 = ¥1950.75';
+  const measured = wrapConfirmationText(realValue, measure('本项计算式：¥2295.0', font), text => measure(text, font));
+  assert.equal(measured.join(''), realValue);
+  for (const token of ['¥2295.00', '0.85', '¥1950.75']) assert.ok(measured.some(line => line.includes(token)));
+});
+
+test('正负号与币种前缀及千分位金额绑定，不把符号或金额尾数拆到另一行', () => {
+  const count = (value: string) => segments(value).length;
+  for (const token of ['−¥10.00', '-¥10.00', '+¥10.00', '¥1,234.56', '￥553.00', '−0.85']) {
+    const value = `调整金额：${token}`; const width = count(token) + 2;
+    const lines = wrapConfirmationText(value, width, count);
+    assert.equal(lines.join(''), value); assert.ok(lines.every(line => count(line) <= width));
+    assert.ok(lines.some(line => line.includes(token)), `${token}的符号与数值必须在同一行`);
+  }
+});
+
+test('金额或折扣紧邻闭合标点时整段一起移动，中文禁则不能切断数值token', () => {
+  const count = (value: string) => segments(value).length;
+  const cases: [string, number, string][] = [
+    ['费用：¥553.00）。', 10, '¥553.00）。'],
+    ['折扣：0.85，', 7, '0.85，'],
+    ['费用：（¥553.00）。', 11, '（¥553.00）。']
+  ];
+  for (const [value, width, group] of cases) {
+    const lines = wrapConfirmationText(value, width, count);
+    assert.equal(lines.join(''), value); assert.ok(lines.every(line => count(line) <= width));
+    assert.ok(lines.some(line => line.includes(group)), `${group}能放在一行时不能从金额内部回退断行`);
+    assert.ok(lines.every(line => !/^[。，、：；！？）》」』】”’]/u.test(line.trimStart())));
+    assert.ok(lines.slice(0, -1).every(line => !/[（《「『【“‘]$/u.test(line.trimEnd())));
+  }
+});
+
+test('超宽金额token按字素降级仍完整且宽内，显式数值换行保持原样', () => {
+  const count = (value: string) => segments(value).length;
+  const value = '合计¥12345678901234567890.00'; const lines = wrapConfirmationText(value, 8, count);
+  assert.equal(lines.join(''), value); assert.ok(lines.every(line => count(line) <= 8)); assert.ok(lines.length > 2);
+  assert.deepEqual(wrapConfirmationText('¥553.\n00', 20, count), ['¥553.', '00']);
 });
 
 test('图片布局固定横向宽度，项目及长承诺只增加纵向高度且保留尾部内容', () => {
