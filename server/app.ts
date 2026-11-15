@@ -596,7 +596,15 @@ export function createApp(options: AppOptions = {}) {
     }); res.status(result.repeated ? 200 : 201).json(result.order);
   });
   app.post('/api/orders/:id/confirm', (req, res) => { const result = tx(() => { const order = get<Order>('orders', String(req.params.id)); checkQuoteVersion(order, req.body); if (order.status === 'cancelled') fail(409, '订单已取消'); if (order.customerConfirmedAt) return order; order.customerConfirmedAt = now(); order.status = 'confirmed'; saveOrder(order); audit(req, '登记客户确认', 'order', order.id, order.code, { status: 'draft' }, { status: order.status, quoteVersion: order.quoteVersion, totalCents: order.totalCents }, text(1000).parse(req.body.note || '客服已与客户核实本次报价')); return order; }); res.json(result); });
-  app.post('/api/orders/:id/copy', (req, res) => { const result = tx(() => { const order = get<Order>('orders', String(req.params.id)); checkQuoteVersion(order, req.body); order.copiedAt = now(); saveOrder(order); audit(req, '复制客户确认单', 'order', order.id, order.code, null, { quoteVersion: order.quoteVersion, totalCents: order.totalCents }, '复制仅留档，不等于客户已确认'); return order; }); res.json(result); });
+  app.post('/api/orders/:id/copy', (req, res) => {
+    const body = z.object({ quoteVersion: z.number().int().positive(), version: z.number().int().positive().optional(), format: z.enum(['text', 'image']).default('text'), purpose: z.enum(['copy', 'download']).default('copy') }).parse(req.body);
+    const result = tx(() => {
+      const order = get<Order>('orders', String(req.params.id)); checkQuoteVersion(order, body);
+      order.copiedAt = now(); saveOrder(order);
+      audit(req, body.format === 'image' ? '生成客户确认图' : '复制客户确认单', 'order', order.id, order.code, null, { quoteVersion: order.quoteVersion, totalCents: order.totalCents, format: body.format, purpose: body.purpose }, body.format === 'image' ? `${body.purpose === 'download' ? '下载' : '复制'}图片的报价版本留档，不代表已发送或客户已确认` : '复制仅留档，不等于客户已确认');
+      return order;
+    }); res.json(result);
+  });
   app.post('/api/orders/:id/pay', (req, res) => {
     assertPermission(req, 'payment'); const body = z.object({ walletCents: money, externalCents: money, channel: text(30).default(''), reference: text(120).default(''), note: text(1000).default(''), quoteVersion: z.number().int().positive(), version: z.number().int().positive().optional() }).parse(req.body);
     const result = tx(() => {
