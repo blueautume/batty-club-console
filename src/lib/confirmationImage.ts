@@ -48,7 +48,7 @@ export function layoutConfirmationImage(doc: ConfirmationDocument, measure: (tex
   const headingWidth = measure(heading, font(21, 650));
   text(heading, pageWidth - edge - headingWidth, headingWidth + 1, 21, purple, 650, 32);
   y = Math.max(y, clubEnd) + 10;
-  text(`客户：${doc.customerName} · ${doc.memberLabel}    订单：${doc.orderCode}    第 ${doc.quoteVersion} 版报价 · ${doc.statusLabel}`, edge, contentWidth, 14, muted, 400, 24);
+  text(`客户：${doc.customerName} · ${doc.memberLabel}    订单：${doc.orderCode}    ${doc.statusLabel}`, edge, contentWidth, 14, muted, 400, 24);
   y += 12; line(edge, contentWidth); y += 20;
 
   if (doc.statusNotice) {

@@ -239,7 +239,7 @@ async function downloadConfirmation() {
   try {
     const { order } = await prepareConfirmationImage(snapshot, 'download');
     if (!stillActive()) return;
-    const link = document.createElement('a'); link.href = confirmationImageUrl.value; link.download = `${order.code}-第${order.quoteVersion}版-客户确认单.png`;
+    const link = document.createElement('a'); link.href = confirmationImageUrl.value; link.download = `${order.code}-客户确认单.png`;
     document.body.append(link); link.click(); link.remove(); ElMessage.success('确认图已下载，请发送图片给客户确认');
     try { await refresh(true); } catch { if (stillActive()) ElMessage.warning('图片已下载，列表暂未刷新'); }
   } catch (error) { if (stillActive()) { clearConfirmationImage(); confirmationImageError.value = error instanceof Error ? error.message : '图片下载失败，请重试'; previewOpen.value = true; } }
@@ -283,7 +283,7 @@ function auditValue(k: string, v: unknown): string { if (v === undefined || v ==
 
   <el-dialog v-model="previewOpen" title="客户确认图预览" width="min(1160px, 96vw)" append-to-body :close-on-click-modal="!busy" :close-on-press-escape="!busy" :show-close="!busy">
     <p class="confirmation-preview-hint">展示服务内容、每项价格和费用汇总。</p>
-    <p v-if="confirmationSnapshot" class="confirmation-preview-version">{{ confirmationSnapshot.code }} · 第 {{ confirmationSnapshot.quoteVersion }} 版报价</p>
+    <p v-if="confirmationSnapshot" class="confirmation-preview-version">{{ confirmationSnapshot.code }}</p>
     <el-alert v-if="previewStale" title="订单已更新，请重新预览后再复制或下载。" type="warning" :closable="false" show-icon class="confirmation-preview-alert" />
     <el-alert v-if="confirmationImageError" :title="confirmationImageError" type="error" :closable="false" show-icon class="confirmation-preview-alert" />
     <div v-if="confirmationImageUrl" class="confirmation-preview-scroll"><img :src="confirmationImageUrl" :alt="`${confirmationSnapshot?.code || ''}客户确认单`" :width="confirmationDimensions.width" :height="confirmationDimensions.height" class="confirmation-preview-image" /></div>
