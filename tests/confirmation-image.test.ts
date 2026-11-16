@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { priceQuote, defaultSettings } from '../shared/pricing.ts';
-import { itemPriceExplanation } from '../shared/priceExplanation.ts';
 import { buildConfirmationDocument, wrapConfirmationText } from '../shared/confirmation.ts';
 import { layoutConfirmationImage } from '../src/lib/confirmationImage.ts';
 import type { Order, QuoteItemInput } from '../shared/types.ts';
@@ -25,77 +24,100 @@ const measure = (text: string, font: string) => {
   return segments(text).reduce((sum, segment) => sum + (/[\u2e80-\uffff]|\p{Extended_Pictographic}/u.test(segment) ? size : size * 0.58), 0);
 };
 
-test('确认单包含截图中的完整保存报价解释、手机阅读所需的安排与本单合计', () => {
+const forbiddenImageFields = new Set(['steps', 'formula', 'notes', 'groups', 'calculationNotes', 'totalFormula', 'allocation']);
+function assertSummaryOnly(value: unknown): void {
+  if (!value || typeof value !== 'object') return;
+  if (Array.isArray(value)) { value.forEach(assertSummaryOnly); return; }
+  for (const [key, child] of Object.entries(value)) {
+    assert.ok(!forbiddenImageFields.has(key), `简洁确认图不应携带详细计价字段 ${key}`);
+    assertSummaryOnly(child);
+  }
+}
+const visibleText = (doc: ReturnType<typeof buildConfirmationDocument>) => layoutConfirmationImage(doc, measure).commands.filter(command => command.type === 'text').map(command => command.text).join('\n');
+const amountCents = (value: string) => Math.round(Number(value.replace(/[¥￥,]/g, '').replace('−', '-')) * 100);
+const summaryCents = (doc: ReturnType<typeof buildConfirmationDocument>) => doc.summaryRows.reduce((sum, row) => sum + amountCents(row.value), 0);
+
+test('简洁确认图保留每项内容、安排、价格和汇总，不携带或绘制详细计算过程', () => {
   const source = order(); const before = structuredClone(source);
   const doc = buildConfirmationDocument(source, context);
   assert.equal(doc.orderCode, 'BT202611160001'); assert.equal(doc.quoteVersion, 3);
   assert.equal(doc.customerName, '星河'); assert.equal(doc.clubName, '贝蒂电竞俱乐部');
+  assert.equal(doc.items[0].title, '机密 · 技术陪');
   assert.equal(doc.items[0].amount, '¥204.00'); assert.equal(doc.total, '¥204.00');
-  assert.equal(doc.items[0].formula, '¥240.00 × 0.85 = ¥204.00');
-  assert.deepEqual(doc.items[0].steps, itemPriceExplanation(source.items[0]).steps);
-  assert.deepEqual(doc.items[0].notes, itemPriceExplanation(source.items[0]).notes);
+  assert.match(doc.items[0].meta.join(' '), /陪玩.*1.*客户.*1/);
+  assert.match(doc.items[0].meta.join(' '), /购买.*2.*小时/);
+  assert.match(doc.items[0].meta.join(' '), /会员.*8\.5折/);
   assert.match(doc.items[0].appointment, /2026.*11.*16.*10:30/);
   assert.match(doc.items[0].player, /指定人选/); assert.equal(doc.items[0].promise, source.items[0].promise);
-  assert.equal(doc.promise, source.promise); assert.equal(doc.totalFormula, '¥204.00 = ¥204.00');
-  const summary = documentText(doc.summaryRows); assert.match(summary, /240\.00/); assert.match(summary, /36\.00/);
+  assert.equal(doc.promise, source.promise);
+  assert.equal(summaryCents(doc), source.totalCents);
+  assertSummaryOnly(doc);
+  const text = visibleText(doc);
+  assert.doesNotMatch(text, /费用计算明细|本项计算式|合计计算式|计价说明|分摊|四舍五入|×| = /);
+  for (const value of ['机密 · 技术陪', '¥204.00', '¥240.00', '−¥36.00', source.items[0].promise, source.promise]) {
+    assert.ok(text.replaceAll('\n', '').includes(value), `${value}应完整出现在确认图`);
+  }
   assert.deepEqual(source, before, '生成对客内容不能修改原始订单');
 });
 
-test('旧报价不会读取现价，女陪与一陪二显示原报价保存的附加合计', () => {
+test('旧报价只展示保存的女陪与一陪二内容及折后价格，不读取现价或输出附加计算', () => {
   const source = order([input({ female: true, customerCount: 2 })]);
   const doc = buildConfirmationDocument(source, context);
   const changed = structuredClone(defaultSettings);
   changed.prices['机密']['技术陪'] = 99000; changed.femaleHourlyCents = 8000; changed.members['红卡'].rate = 0.5;
   const newQuote = priceQuote([input({ female: true, customerCount: 2 })], { member: '红卡', benefit: 'discount' }, changed);
   assert.notEqual(newQuote.totalCents, source.totalCents);
-  assert.equal(doc.items[0].formula, '¥300.00 × 0.85 = ¥255.00');
-  assert.match(doc.items[0].steps[0], /指定女陪、一陪二附加合计 ¥30\.00/);
-  assert.equal(doc.total, '¥255.00'); assert.deepEqual(buildConfirmationDocument(source, context), doc);
+  assert.equal(doc.items[0].amount, '¥255.00'); assert.equal(doc.total, '¥255.00');
+  assert.match(doc.items[0].meta.join(' '), /客户.*2.*位/); assert.match(doc.items[0].meta.join(' '), /指定女陪/);
+  assert.equal(summaryCents(doc), source.totalCents); assertSummaryOnly(doc);
+  assert.doesNotMatch(visibleText(doc), /附加合计|计费单价|计算式/);
+  assert.deepEqual(buildConfirmationDocument(source, context), doc);
 });
 
-test('混档双陪显示整组分摊及尾差，汇总使用各项折后金额而不重复减优惠', () => {
+test('混档双陪逐项显示折后金额和整组优惠汇总，不输出分摊过程且不重复扣优惠', () => {
   const source = order([
     input({ hours: 0.5, groupId: 'mixed', groupDiscountHourlyCents: 1 }),
     input({ id: 'item-b', tier: '娱乐陪', hours: 0.5, groupId: 'mixed', groupDiscountHourlyCents: 1 })
   ]);
   const doc = buildConfirmationDocument(source, context);
-  assert.equal(doc.items[0].amount, '¥50.99'); assert.equal(doc.items[1].amount, '¥25.50');
-  assert.equal(doc.totalFormula, '¥50.99 + ¥25.50 = ¥76.49'); assert.equal(doc.total, '¥76.49');
-  assert.match(doc.groups[0].formula, /整组减免 ¥0\.01 = ¥0\.01 \+ ¥0\.00/);
-  assert.match(doc.groups[0].allocation, /尾差/);
-  assert.match(doc.items[0].formula, /\(¥60\.00 − ¥0\.01\) × 0\.85 = ¥50\.99/);
+  assert.equal(doc.items[0].amount, '¥50.99'); assert.equal(doc.items[1].amount, '¥25.50'); assert.equal(doc.total, '¥76.49');
+  assert.ok(doc.items.every(item => /双陪组合/.test(item.meta.join(' '))));
+  assert.equal(doc.items.reduce((sum, item) => sum + amountCents(item.amount), 0), amountCents(doc.total));
+  assert.equal(summaryCents(doc), source.totalCents);
+  assert.ok(doc.summaryRows.some(row => /双陪/.test(row.label) && row.value === '−¥0.01'));
+  assertSummaryOnly(doc); assert.doesNotMatch(visibleText(doc), /分摊|尾差|÷|×|计算式/);
 });
 
-test('99元体验只显示固定活动价，不把购买时长重复相乘', () => {
+test('99元体验保留活动标识、约定时长和保障，只显示固定99元价格', () => {
   const doc = buildConfirmationDocument(order([input({ kind: 'trial', hours: 3, discount: 'none', promise: '888W／包撤离，以本单约定为准' })]), context);
   assert.equal(doc.items[0].amount, '¥99.00'); assert.equal(doc.total, '¥99.00');
-  assert.equal(doc.items[0].formula, '活动固定价 ¥99.00 = ¥99.00');
-  assert.match(documentText(doc.items[0].notes), /不按小时再次相乘/);
-  assert.match(documentText(doc.items[0]), /888W/);
+  assert.match(doc.items[0].title, /新客体验/); assert.match(doc.items[0].meta.join(' '), /3.*小时/);
+  assert.match(doc.items[0].meta.join(' '), /固定活动价/); assert.match(doc.items[0].promise, /888W/);
+  assert.equal(summaryCents(doc), 9900); assertSummaryOnly(doc);
 });
 
-test('补款单保留关联原单与金额说明，不新增服务或重复叠加补款', () => {
+test('补款单保留关联原单、补款说明和正确总价，不重复叠加或虚构服务', () => {
   const source = order(undefined, { kind: 'supplement', items: [], subtotalCents: 0, groupDiscountCents: 0, discountCents: 0, totalCents: 2500, adjustmentCents: 2500, adjustmentReason: '客户确认额外约定费用', parentOrderId: 'original-order' });
   const doc = buildConfirmationDocument(source, context);
-  assert.deepEqual(doc.items, []); assert.equal(doc.total, '¥25.00');
-  assert.equal(doc.totalFormula, '¥0.00 + ¥25.00 = ¥25.00');
+  assert.deepEqual(doc.items, []); assert.equal(doc.total, '¥25.00'); assert.equal(summaryCents(doc), 2500);
   assert.match(documentText(doc), /BT-PARENT/); assert.match(documentText(doc), /客户确认额外约定费用/);
-  assert.match(documentText(layoutConfirmationImage(doc, measure).commands), /不新增服务/);
+  const text = visibleText(doc); assert.match(text, /不新增服务/); assert.doesNotMatch(text, /计算式|×| = /);
+  assertSummaryOnly(doc);
 });
 
-test('整单减免至零仍给出准确合计和约定原因，订单状态不冒充待付款', () => {
+test('整单减免至零仍显示准确汇总和调整原因，付款或取消状态不会冒充待付款通知', () => {
   const zero = order(undefined, { adjustmentCents: -20400, adjustmentReason: '本次约定全部减免', totalCents: 0 });
   const doc = buildConfirmationDocument(zero, context);
-  assert.equal(doc.total, '¥0.00'); assert.equal(doc.totalFormula, '¥204.00 − ¥204.00 = ¥0.00');
-  assert.match(documentText(doc), /本次约定全部减免/);
+  assert.equal(doc.total, '¥0.00'); assert.equal(summaryCents(doc), 0);
+  assert.match(documentText(doc), /本次约定全部减免/); assertSummaryOnly(doc);
   const cancelled = buildConfirmationDocument(order(undefined, { status: 'cancelled' }), context);
   assert.match(`${cancelled.statusLabel} ${cancelled.statusNotice}`, /取消/);
   const paid = buildConfirmationDocument(order(undefined, { status: 'paid', payment: { id: 'pay-a', walletCents: 20400, externalCents: 0, channel: '', reference: 'PRIVATE-PAYMENT-REFERENCE', note: 'PRIVATE-PAYMENT-NOTE', actorId: 'actor-a', actorName: 'PRIVATE-PAYMENT-ACTOR', createdAt: '2026-11-16T02:00:00.000Z' } }), context);
-  assert.match(`${paid.statusLabel} ${paid.statusNotice}`, /结清|已付款/);
+  assert.match(`${paid.statusLabel} ${paid.statusNotice}`, /结清|已付款/); assert.match(paid.statusNotice, /勿重复付款/);
   assert.equal(paid.total, '¥204.00');
 });
 
-test('对客文档只取允许字段，内部备注、应得与凭证不会进入图片', () => {
+test('对客文档只取允许字段，内部备注、应得与凭证不会进入模型或绘图', () => {
   const source = order(undefined, {
     assignments: [
       { id: 'assignment-old', itemId: 'item-a', playerId: 'old', playerName: '旧人选', status: 'replaced', assignedAt: '2026-11-16T01:01:00Z', freeMinutes: 0, earningCents: 987654, settled: true, reason: 'PRIVATE-OLD-ASSIGNMENT-REASON' },
@@ -106,7 +128,7 @@ test('对客文档只取允许字段，内部备注、应得与凭证不会进�
   });
   const doc = buildConfirmationDocument(source, context);
   assert.match(doc.items[0].player, /实际人选/); assert.doesNotMatch(doc.items[0].player, /旧人选/);
-  const text = documentText(doc); assert.doesNotMatch(text, /PRIVATE-|987654|876543|earningCents|passwordHash/);
+  for (const text of [documentText(doc), visibleText(doc)]) assert.doesNotMatch(text, /PRIVATE-|987654|876543|earningCents|passwordHash/);
 });
 
 test('长中文、连续英文和组合emoji按字素换行，不丢失字符或拆开组合', () => {
@@ -223,23 +245,30 @@ test('超宽金额token按字素降级仍完整且宽内，显式数值换行保
   assert.deepEqual(wrapConfirmationText('¥553.\n00', 20, count), ['¥553.', '00']);
 });
 
-test('图片布局固定横向宽度，项目及长承诺只增加纵向高度且保留尾部内容', () => {
+test('横向确认图标题在左价格在右，单项图紧凑且多项仅增加高度', () => {
   const single = buildConfirmationDocument(order(), context);
   const many = buildConfirmationDocument(order(Array.from({ length: 30 }, (_, index) => input({ id: `item-${index}`, requestedPlayerId: '', plannedStart: '', promise: '' }))), context);
   const long = buildConfirmationDocument(order([input({ promise: '这一段对客约定必须完整展示。'.repeat(18) + '最终保障内容结束' })]), context);
   const oneLayout = layoutConfirmationImage(single, measure); const manyLayout = layoutConfirmationImage(many, measure); const longLayout = layoutConfirmationImage(long, measure);
-  assert.equal(oneLayout.width, 540); assert.equal(manyLayout.width, oneLayout.width); assert.equal(longLayout.width, oneLayout.width);
+  assert.equal(oneLayout.width, 1100); assert.equal(manyLayout.width, oneLayout.width); assert.equal(longLayout.width, oneLayout.width);
+  assert.ok(oneLayout.height < 900, '普通单项确认图不应保留旧版竖向大封面和计算过程的高度');
+  const heading = oneLayout.commands.find(command => command.type === 'text' && command.text.includes(single.items[0].title));
+  const price = oneLayout.commands.find(command => command.type === 'text' && command.text === single.items[0].amount);
+  assert.ok(heading && price); assert.ok(price.x > heading.x + 400, '单项价格应位于标题右侧');
+  assert.ok(Math.abs(price.y - heading.y) <= 36, '短标题与单项价格应在同一横向标题行');
   assert.ok(manyLayout.height > oneLayout.height * 5); assert.ok(longLayout.height > oneLayout.height);
   assert.match(longLayout.commands.filter(command => command.type === 'text').map(command => command.text).join(''), /最终保障内容结束/);
-  for (const command of longLayout.commands) {
-    assert.ok(command.y >= 0 && command.y < longLayout.height, '所有内容必须位于图片纵向边界内');
-    if (command.type === 'text') assert.ok(command.x + measure(command.text, command.font) <= longLayout.width + 0.01, '长文本不能超出图片横向边界');
-    if (command.type === 'box') assert.ok(command.y + command.height <= longLayout.height, '卡片背景不能被图片截断');
+  for (const value of [oneLayout, manyLayout, longLayout]) {
+    for (const command of value.commands) {
+      assert.ok(command.y >= 0 && command.y < value.height, '所有内容必须位于图片纵向边界内');
+      if (command.type === 'text') assert.ok(command.x + measure(command.text, command.font) <= value.width + 0.01, '长文本不能超出图片横向边界');
+      if (command.type === 'box') assert.ok(command.y + command.height <= value.height, '卡片背景不能被图片截断');
+    }
   }
   assert.ok(Number.isFinite(manyLayout.height));
 });
 
-test('最大长度承诺导致超长图片时明确提示，不能静默丢弃订单尾部', () => {
+test('超过安全总尺寸时明确提示，不能静默丢弃订单尾部', () => {
   const maximumText = '客户服务保障与安排说明'.repeat(200).slice(0, 2000);
   const source = order(Array.from({ length: 30 }, (_, index) => input({ id: `max-item-${index}`, promise: maximumText })), { promise: maximumText });
   const doc = buildConfirmationDocument(source, context);

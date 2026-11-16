@@ -1,7 +1,7 @@
 import type { Order } from './types.ts';
-import { groupPriceExplanations, itemPriceExplanation, priceMoney, quotePriceFormula } from './priceExplanation.ts';
+import { priceDiscountLabel, priceMoney } from './priceExplanation.ts';
 
-export const CONFIRMATION_LOGICAL_WIDTH = 540;
+export const CONFIRMATION_LOGICAL_WIDTH = 1100;
 export const CONFIRMATION_IMAGE_SCALE = 2;
 export const CONFIRMATION_IMAGE_WIDTH = CONFIRMATION_LOGICAL_WIDTH * CONFIRMATION_IMAGE_SCALE;
 export const CONFIRMATION_MAX_IMAGE_HEIGHT = 59000;
@@ -17,9 +17,6 @@ export interface ConfirmationService {
   title: string;
   amount: string;
   meta: string[];
-  steps: string[];
-  formula: string;
-  notes: string[];
   appointment: string;
   player: string;
   promise: string;
@@ -37,10 +34,7 @@ export interface ConfirmationDocument {
   supplementReason: string;
   adjustmentReason: string;
   items: ConfirmationService[];
-  groups: { title: string; formula: string; allocation: string; notes: string[] }[];
-  calculationNotes: string[];
   summaryRows: { label: string; value: string }[];
-  totalFormula: string;
   total: string;
   totalLabel: string;
   promise: string;
@@ -80,22 +74,15 @@ export function buildConfirmationDocument(order: Order, context: ConfirmationCon
     items: order.items.map((item, index) => {
       const assignment = order.assignments.find(current => current.itemId === item.id && !['replaced', 'cancelled'].includes(current.status));
       const requested = context.playerNames?.[item.requestedPlayerId];
-      const explanation = itemPriceExplanation(item);
       return {
         index: String(index + 1).padStart(2, '0'), title: `${item.mode} · ${item.tier}${item.kind === 'trial' ? ' · 新客体验' : ''}`,
         amount: priceMoney(item.totalCents),
-        meta: [`陪玩 1 位 · 客户 ${item.customerCount} 位`, `购买 ${item.hours} 小时`, explanation.discountLabel, ...(item.female ? ['指定女陪'] : []), ...(item.groupId ? ['双陪组合'] : [])],
-        steps: [...explanation.steps], formula: explanation.formula, notes: [...explanation.notes],
+        meta: [`陪玩 1 位 · 客户 ${item.customerCount} 位`, `购买 ${item.hours} 小时`, priceDiscountLabel(item), ...(item.female ? ['指定女陪'] : []), ...(item.groupId ? ['双陪组合'] : [])],
         appointment: item.plannedStart ? formatDate(item.plannedStart) : '待客服协调',
         player: assignment?.playerName || (requested ? `指定 ${requested}` : '按档位安排'), promise: item.promise
       };
     }),
-    groups: groupPriceExplanations(order.items).map((group, index) => ({
-      title: `双陪组合 ${index + 1} · 优惠核对`, formula: group.formula, allocation: group.allocation,
-      notes: [...new Set(order.items.filter(item => item.groupId === group.groupId).flatMap(item => itemPriceExplanation(item).notes.filter(note => note.startsWith('整组优惠') || note.startsWith('此双陪组合'))))]
-    })),
-    calculationNotes: [...new Set(order.items.flatMap(item => itemPriceExplanation(item).notes.filter(note => !note.startsWith('整组优惠') && !note.startsWith('此双陪组合'))))],
-    summaryRows, totalFormula: quotePriceFormula(order.items, order.totalCents, order.adjustmentCents),
+    summaryRows,
     total: priceMoney(order.totalCents), totalLabel: cancelled || refunded > 0 ? '原报价合计' : paid ? '本单报价合计' : supplement ? '本单补款合计' : '本单应付合计',
     promise: order.promise,
     footer: cancelled || refunded > 0 || paid ? '报价记录留存 · 售后及续时安排请联系服务客服。' : '请确认以上服务安排与总价。延长服务时，另行确认续单费用。'

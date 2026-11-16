@@ -14,136 +14,110 @@ export type ConfirmationDrawCommand = TextCommand | BoxCommand | LineCommand;
 export interface ConfirmationLayout { width: number; height: number; commands: ConfirmationDrawCommand[]; }
 export interface ConfirmationImage { blob: Blob; width: number; height: number; }
 
-/** Measured once and drawn once, with no dependency on screen size or drawer state. */
+/** Export a compact desktop-style quotation, independently of the current page width. */
 export function layoutConfirmationImage(doc: ConfirmationDocument, measure: (text: string, font: string) => number): ConfirmationLayout {
   const commands: ConfirmationDrawCommand[] = [];
-  const pageWidth = CONFIRMATION_LOGICAL_WIDTH, edge = 28, contentWidth = pageWidth - edge * 2;
-  let y = 0;
+  const pageWidth = CONFIRMATION_LOGICAL_WIDTH, edge = 24, contentWidth = pageWidth - edge * 2;
+  let y = 26;
   const font = (size: number, weight = 400) => `${weight} ${size}px ${fontFamily}`;
-  const text = (value: string, x: number, width: number, size = 22, color = ink, weight = 400, lineHeight = Math.ceil(size * 1.55)) => {
+  const text = (value: string, x: number, width: number, size = 15, color = ink, weight = 400, lineHeight = Math.ceil(size * 1.65)) => {
     const style = font(size, weight);
-    const lines = wrapConfirmationText(value, width, line => measure(line, style));
-    for (const line of lines) { commands.push({ type: 'text', text: line, x, y, font: style, color }); y += lineHeight; }
+    for (const valueLine of wrapConfirmationText(value, width, line => measure(line, style))) {
+      commands.push({ type: 'text', text: valueLine, x, y, font: style, color }); y += lineHeight;
+    }
   };
-  const box = (x: number, width: number, fill = '#ffffff', stroke?: string, radius = 16) => {
+  const box = (x: number, width: number, fill = '#ffffff', stroke?: string, radius = 10) => {
     const command: BoxCommand = { type: 'box', x, y, width, height: 0, radius, fill, stroke }; commands.push(command); return command;
   };
-  const line = (x: number, width: number, dashed = false) => { commands.push({ type: 'line', x, y, width, color: border, dashed }); };
-  const field = (label: string, value: string, x = edge + 24, width = contentWidth - 48) => {
-    text(label, x, width, 17, muted, 500, 27);
-    text(value, x, width, 21, ink, 400, 32);
+  const line = (x: number, width: number) => { commands.push({ type: 'line', x, y, width, color: border }); };
+  const columns = (left: string, right: string, x: number, width: number, leftSize: number, rightSize: number, rightColor = ink, rightWeight = 600) => {
+    const measuredValueWidth = measure(right, font(rightSize, rightWeight));
+    const valueWidth = Math.max(130, Math.min(measuredValueWidth, width * 0.42));
+    const top = y;
+    text(left, x, width - valueWidth - 22, leftSize, muted, 400);
+    const leftEnd = y; y = top;
+    const drawWidth = Math.min(valueWidth, measuredValueWidth);
+    text(right, x + width - drawWidth, drawWidth + 1, rightSize, rightColor, rightWeight);
+    y = Math.max(y, leftEnd);
   };
 
-  commands.push({ type: 'box', x: 0, y: 0, width: pageWidth, height: 10, radius: 0, fill: purple });
-  y = 38;
-  text('BATTY CLUB', edge, contentWidth, 14, purple, 700, 23);
-  text(doc.clubName, edge, contentWidth, 25, ink, 650, 37);
-  y += 12;
-  text(doc.kind === 'supplement' ? '补款确认单' : '客户确认单', edge, contentWidth, 34, ink, 700, 48);
-  text(`第 ${doc.quoteVersion} 版报价 · ${doc.statusLabel}`, edge, contentWidth, 18, muted, 400, 29);
-  y += 22;
-
-  const identity = box(edge, contentWidth, pale);
-  y += 22;
-  field('客户', `${doc.customerName} · ${doc.memberLabel}`);
-  y += 14;
-  field('订单编号', doc.orderCode);
-  if (doc.kind === 'supplement') { y += 14; field('关联原订单', doc.parentOrderCode); }
-  y += 22; identity.height = y - identity.y;
-  y += 24;
+  const titleY = y;
+  text(doc.clubName, edge, contentWidth * 0.62, 22, ink, 650, 32);
+  const clubEnd = y; y = titleY;
+  const heading = doc.kind === 'supplement' ? '补款确认单' : '客户确认单';
+  const headingWidth = measure(heading, font(21, 650));
+  text(heading, pageWidth - edge - headingWidth, headingWidth + 1, 21, purple, 650, 32);
+  y = Math.max(y, clubEnd) + 10;
+  text(`客户：${doc.customerName} · ${doc.memberLabel}    订单：${doc.orderCode}    第 ${doc.quoteVersion} 版报价 · ${doc.statusLabel}`, edge, contentWidth, 14, muted, 400, 24);
+  y += 12; line(edge, contentWidth); y += 20;
 
   if (doc.statusNotice) {
-    const notice = box(edge, contentWidth, '#fff8eb', '#f3e5c8');
-    y += 18; text(doc.statusNotice, edge + 20, contentWidth - 40, 19, '#94692e', 500, 30); y += 18; notice.height = y - notice.y; y += 24;
+    const notice = box(edge, contentWidth, '#fff8eb', '#f3e5c8', 8);
+    y += 12; text(doc.statusNotice, edge + 16, contentWidth - 32, 14, '#94692e', 500, 23);
+    y += 12; notice.height = y - notice.y; y += 18;
   }
 
-  text(doc.kind === 'supplement' ? '本次补款约定' : `服务与报价明细 · ${doc.items.length} 项`, edge, contentWidth, 22, ink, 650, 34);
-  y += 14;
   if (doc.kind === 'supplement') {
     const supplement = box(edge, contentWidth, '#ffffff', border);
-    y += 24; text(doc.supplementReason || '按客服确认的补款约定执行', edge + 24, contentWidth - 48, 22, ink, 500, 35);
-    y += 14; text('仅补充约定费用，不新增服务时长。', edge + 24, contentWidth - 48, 19, muted, 400, 30);
-    y += 24; supplement.height = y - supplement.y; y += 20;
+    y += 18;
+    columns('关联补款单', doc.total, edge + 20, contentWidth - 40, 18, 26, purple, 700);
+    y += 10; text(`关联原订单：${doc.parentOrderCode}`, edge + 20, contentWidth - 40, 14, muted, 400, 23);
+    text(doc.supplementReason || '按客服确认的补款约定执行', edge + 20, contentWidth - 40, 15, ink, 400, 25);
+    text('仅补充约定费用，不新增服务时长。', edge + 20, contentWidth - 40, 13, muted, 400, 22);
+    y += 18; supplement.height = y - supplement.y; y += 18;
   }
 
   for (const item of doc.items) {
     const card = box(edge, contentWidth, '#ffffff', border);
-    const x = edge + 24, width = contentWidth - 48;
-    y += 24;
-    text(`${item.index}  ${item.title}`, x, width, 25, ink, 650, 37);
-    text(item.amount, x, width, 30, purple, 700, 45);
-    y += 8;
-    for (const meta of item.meta) text(meta, x, width, 19, muted, 400, 29);
-    y += 18;
-
-    const calculation = box(x - 4, width + 8, '#faf9ff', undefined, 10);
-    y += 17;
-    const mathX = x + 12, mathWidth = width - 24;
-    text('费用计算明细', mathX, mathWidth, 19, purple, 650, 31);
-    y += 7;
-    for (const step of item.steps) { text(step, mathX, mathWidth, 20, '#575368', 400, 31); y += 10; }
-    line(mathX, mathWidth, true); y += 15;
-    text('本项计算式', mathX, mathWidth, 17, muted, 500, 27);
-    text(item.formula, mathX, mathWidth, 21, purple, 650, 33);
-    y += 10;
-    y += 12; calculation.height = y - calculation.y;
+    const x = edge + 20, width = contentWidth - 40;
     y += 20;
-
-    field('预约时间', item.appointment, x, width); y += 12;
-    field('陪玩人选', item.player, x, width);
-    if (item.promise) { y += 16; field('服务承诺', item.promise, x, width); }
-    y += 24; card.height = y - card.y; y += 20;
+    const titleTop = y;
+    const indexBox = box(x, 28, '#efecfb', undefined, 4); indexBox.height = 28;
+    y += 5;
+    text(item.index, x + 6, 24, 12, '#a396c8', 650, 18);
+    y = titleTop;
+    const measuredAmountWidth = measure(item.amount, font(26, 700));
+    const amountWidth = Math.max(145, Math.min(measuredAmountWidth, width * 0.35));
+    text(item.title, x + 42, width - amountWidth - 60, 19, '#48465e', 650, 31);
+    const titleEnd = y; y = titleTop;
+    const drawAmountWidth = Math.min(amountWidth, measuredAmountWidth);
+    text(item.amount, x + width - drawAmountWidth, drawAmountWidth + 1, 26, purple, 700, 34);
+    y = Math.max(y, titleEnd) + 13;
+    text(item.meta.join('    '), x, width, 14, '#8f8fa4', 400, 25);
+    y += 12; line(x, width); y += 13;
+    text(`预约：${item.appointment}    人选：${item.player}`, x, width, 13, '#8c8da4', 400, 23);
+    if (item.promise) {
+      y += 10;
+      const promise = box(x, width, '#faf9fd', undefined, 6);
+      y += 10; text(`服务承诺：${item.promise}`, x + 12, width - 24, 14, '#777b91', 400, 24);
+      y += 10; promise.height = y - promise.y;
+    }
+    y += 18; card.height = y - card.y; y += 18;
   }
 
-  for (const group of doc.groups) {
-    const groupBox = box(edge, contentWidth, pale);
-    y += 20; text(group.title, edge + 22, contentWidth - 44, 21, purple, 650, 33); y += 9;
-    text(group.formula, edge + 22, contentWidth - 44, 19, ink, 400, 30); y += 10;
-    text(group.allocation, edge + 22, contentWidth - 44, 17, muted, 400, 27);
-    for (const note of group.notes) { y += 10; text(note, edge + 22, contentWidth - 44, 17, muted, 400, 27); }
-    y += 20; groupBox.height = y - groupBox.y; y += 20;
-  }
-
-  y += 5;
-  const summary = box(edge, contentWidth, '#ffffff', border);
-  const sumX = edge + 24, sumWidth = contentWidth - 48;
-  y += 24;
-  text('费用合计', sumX, sumWidth, 24, ink, 650, 38); y += 10;
+  const sumWidth = 420, sumX = pageWidth - edge - sumWidth;
+  y += 2;
   for (const row of doc.summaryRows) {
-    const rowY = y, valueStyle = font(21, 600), valueWidth = Math.min(measure(row.value, valueStyle), sumWidth * 0.62);
-    const labelWidth = sumWidth - valueWidth - 12;
-    text(row.label, sumX, labelWidth, 20, muted, 400, 31);
-    const labelEnd = y; y = rowY;
-    text(row.value, sumX + sumWidth - valueWidth, valueWidth + 1, 21, ink, 600, 31);
-    y = Math.max(y, labelEnd) + 11;
+    columns(row.label, row.value, sumX, sumWidth, 14, 16, '#616174', 550);
+    y += 7;
   }
-  y += 4; line(sumX, sumWidth, true); y += 18;
-  text('合计计算式', sumX, sumWidth, 17, muted, 500, 28);
-  text(doc.totalFormula, sumX, sumWidth, 21, purple, 650, 34);
-  if (doc.adjustmentReason) { y += 14; field('整单调整说明', doc.adjustmentReason, sumX, sumWidth); }
-  y += 18; line(sumX, sumWidth); y += 22;
-  text(doc.totalLabel, sumX, sumWidth, 20, ink, 500, 32);
-  text(doc.total, sumX, sumWidth, 42, purple, 750, 58);
-  y += 24; summary.height = y - summary.y;
-  y += 22;
+  if (doc.adjustmentReason) {
+    y += 3; text(`调整说明：${doc.adjustmentReason}`, sumX, sumWidth, 13, muted, 400, 22); y += 8;
+  }
+  y += 5; line(sumX, sumWidth); y += 18;
+  columns(doc.totalLabel, doc.total, sumX, sumWidth, 18, 31, purple, 700);
+  y += 18;
 
   if (doc.promise) {
-    const promise = box(edge, contentWidth, pale);
-    y += 22; text('本单服务约定', edge + 24, contentWidth - 48, 21, purple, 650, 33); y += 8;
-    text(doc.promise, edge + 24, contentWidth - 48, 21, ink, 400, 34);
-    y += 22; promise.height = y - promise.y; y += 24;
+    const promise = box(edge, contentWidth, pale, undefined, 7);
+    y += 12; text(`本单服务约定：${doc.promise}`, edge + 16, contentWidth - 32, 14, '#777b91', 400, 24);
+    y += 12; promise.height = y - promise.y; y += 14;
   }
-  if (doc.calculationNotes.length) {
-    text('计价说明', edge + 4, contentWidth - 8, 18, muted, 500, 29);
-    for (const note of doc.calculationNotes) { text(note, edge + 4, contentWidth - 8, 17, '#858093', 400, 27); y += 8; }
-    y += 14;
-  }
-  text(doc.footer, edge + 4, contentWidth - 8, 19, muted, 400, 31);
+  text(doc.footer, edge, contentWidth, 13, '#9993a8', 400, 22);
   y += 20;
-  text('报价以本单保存的版本为准', edge + 4, contentWidth - 8, 16, '#9993a8', 400, 25);
-  y += 32;
-  if (y * CONFIRMATION_IMAGE_SCALE > CONFIRMATION_MAX_IMAGE_HEIGHT || pageWidth * y * CONFIRMATION_IMAGE_SCALE ** 2 > CONFIRMATION_MAX_PIXELS) throw new Error('确认单内容过长，超出单张长图的安全尺寸；请精简重复的服务承诺或拆分订单后重试，系统不会截断明细。');
-  return { width: pageWidth, height: Math.ceil(y), commands };
+  const height = Math.ceil(y), outputHeight = height * CONFIRMATION_IMAGE_SCALE;
+  if (outputHeight > CONFIRMATION_MAX_IMAGE_HEIGHT || CONFIRMATION_IMAGE_WIDTH * outputHeight > CONFIRMATION_MAX_PIXELS) throw new Error('确认单内容过长，超出单张图片的安全尺寸；请精简重复的服务承诺或拆分订单后重试，系统不会截断明细。');
+  return { width: pageWidth, height, commands };
 }
 
 export async function renderConfirmationImage(doc: ConfirmationDocument): Promise<ConfirmationImage> {
@@ -155,14 +129,14 @@ export async function renderConfirmationImage(doc: ConfirmationDocument): Promis
   const layout = layoutConfirmationImage(doc, (value, style) => { measureContext.font = style; return measureContext.measureText(value).width; });
   const canvas = document.createElement('canvas');
   const width = CONFIRMATION_IMAGE_WIDTH, height = layout.height * CONFIRMATION_IMAGE_SCALE;
-  const useBands = height > 16000;
+  const useBands = height > 16000 || width * height > 16_000_000;
   canvas.width = width; canvas.height = useBands ? Math.min(512, height) : height;
   const context = canvas.getContext('2d');
   if (!context) throw new Error('当前浏览器无法生成确认单图片，请更换浏览器重试');
   const brush = context;
   function draw(top = 0) {
     brush.setTransform(1, 0, 0, 1, 0, 0);
-    brush.fillStyle = '#f4f2f9'; brush.fillRect(0, 0, canvas.width, canvas.height);
+    brush.fillStyle = '#ffffff'; brush.fillRect(0, 0, canvas.width, canvas.height);
     brush.setTransform(CONFIRMATION_IMAGE_SCALE, 0, 0, CONFIRMATION_IMAGE_SCALE, 0, -top);
     brush.textBaseline = 'top';
     for (const command of layout.commands) {
