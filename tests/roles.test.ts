@@ -114,7 +114,8 @@ describe('root、普通管理员与股东的简化权限边界', { concurrency: 
       assert.equal((await operator.request(`/api/accounts/${created.data.id}`, { canManageAdmins: true }, 'PUT')).status, 403);
       assert.equal((await operator.request(`/api/accounts/${peer.id}`, { canManageAdmins: false }, 'PUT')).status, 403);
       assert.equal((await operator.request(`/api/accounts/${peer.id}`, { name: '合法编辑', canManageAdmins: true }, 'PUT')).status, 200);
-      const demoted = await operator.request(`/api/accounts/${peer.id}`, { role: 'staff' }, 'PUT');
+      assert.equal((await operator.request(`/api/accounts/${peer.id}`, { role: 'staff' }, 'PUT')).status, 403, '不能通过降级隐式收回root授予的高级权');
+      const demoted = await f.root.request(`/api/accounts/${peer.id}`, { role: 'staff' }, 'PUT');
       assert.equal(demoted.status, 200); assert.equal(demoted.data.canManageAdmins, false);
       const promoted = await operator.request(`/api/accounts/${peer.id}`, { role: 'admin' }, 'PUT');
       assert.equal(promoted.status, 200); assert.equal(promoted.data.canManageAdmins, false);

@@ -5,6 +5,8 @@ import { Plus, Search, Download, Refresh, Key, User, Lock } from '@element-plus/
 import { state, refresh } from '../lib/store';
 import { api, confirmAction, exportFile, money, notifyError } from '../lib/api';
 import { isAdminRole, canManageAdminAccounts, roleLabel } from '../../shared/roles';
+import { hasDirectPermission } from '../../shared/workflow';
+import WorkflowAction from '../components/WorkflowAction.vue';
 import type { AuditEntry, Permission, Role, User as Account } from '../../shared/types';
 
 const tab = ref('accounts');
@@ -14,25 +16,44 @@ const canEditAccount = (account: Account) => account.role !== 'root' && (account
 const accountRoleOptions = computed(() => ([{ value: 'staff', label: '客服' }, { value: 'shareholder', label: '股东' }, ...(mayManageAdmins.value ? [{ value: 'admin', label: '管理员' }] : [])]));
 const query = ref('');
 const roleFilter = ref('');
-const accountRows = computed(() => state.accounts.filter((a: Account) => (!roleFilter.value || a.role === roleFilter.value) && `${a.name} ${a.username}`.toLowerCase().includes(query.value.toLowerCase())));
+const accountScope = ref('normal');
+const accountRows = computed(() => state.accounts.filter((a: Account) => (accountScope.value === 'deleted' ? !!a.deletedAt : !a.deletedAt) && (!roleFilter.value || a.role === roleFilter.value) && `${a.name} ${a.username}`.toLowerCase().includes(query.value.toLowerCase())));
+const workflow = ref<InstanceType<typeof WorkflowAction>>();
+const openAccountLifecycle = (account: Account) => workflow.value?.open({ action: account.deletedAt ? 'accountRestore' : 'accountDelete', targetId: account.id, reason: '', transferTo: '' }, account.deletedAt ? '恢复工作人员账号' : '删除并交接工作人员账号');
 const drawer = ref(false);
 const saving = ref(false);
 const formRef = ref<FormInstance>();
-const form = reactive({ id: '', username: '', name: '', password: '', role: 'staff' as Role, canManageAdmins: false, permissions: ['recharge', 'payment', 'refund', 'players'] as Permission[], active: true });
-const permissionOptions: { value: Permission; title: string; description: string }[] = [
-  { value: 'recharge', title: '充值确认', description: '登记充值并增加客户余额' },
-  { value: 'payment', title: '订单结清', description: '确认外部到账、扣减余额' },
-  { value: 'refund', title: '普通退款', description: '处理未消费部分的退款' },
-  { value: 'players', title: '陪玩档案维护', description: '新增、编辑及停用陪玩成员' },
-  { value: 'export', title: '数据导出', description: '导出有权访问的业务数据' }
+const form = reactive({ id: '', username: '', name: '', password: '', role: 'staff' as Role, canManageAdmins: false, permissions: ['recharge', 'payment', 'refund', 'players'] as Permission[], active: true, version: undefined as number | undefined });
+const permissionOptions: { value: Permission; title: string; description: string; group: string; requestable?: boolean }[] = [
+  { value: 'recharge', title: '充值确认', description: '登记充值并增加客户余额', group: '基础工作权限' },
+  { value: 'payment', title: '订单结清', description: '确认外部到账、扣减余额', group: '基础工作权限' },
+  { value: 'players', title: '陪玩档案维护', description: '新增、编辑成员资料及维护休息状态', group: '基础工作权限' },
+  { value: 'export', title: '数据导出', description: '导出有权访问的业务数据', group: '基础工作权限' },
+  { value: 'cancelConfirmed', title: '已确认订单取消', description: '直接取消本人负责的已确认订单；退款另行检查授权', group: '订单处理直办', requestable: true },
+  { value: 'terminateService', title: '服务提前终止', description: '直接终止本人负责订单中的指定服务', group: '订单处理直办', requestable: true },
+  { value: 'refund', title: '未消费退款', description: '直接处理本人负责订单中未开始服务部分的退款', group: '订单处理直办', requestable: true },
+  { value: 'refundConsumed', title: '已消费售后退款', description: '直接处理本人负责订单中已开始或完成服务的退款', group: '订单处理直办', requestable: true },
+  { value: 'deleteRecords', title: '误建资料删除', description: '直接删除无业务关联的客户、陪玩资料，保留回收站记录', group: '资料处理直办', requestable: true },
+  { value: 'archiveRecords', title: '停用与归档', description: '直接停用或归档本人负责的客户、陪玩资料', group: '资料处理直办', requestable: true },
+  { value: 'reverseRecharge', title: '充值更正', description: '直接更正本人负责客户的充值记录，余额和权益仍需核对', group: '资金处理直办', requestable: true },
+  { value: 'walletRefund', title: '充值本金退款', description: '直接办理本人负责客户的本金退款，登记实际外部凭证', group: '资金处理直办', requestable: true },
+  { value: 'personnelDelete', title: '人员删除', description: '直接删除客服账号及有业务历史的陪玩成员；交接与结算记录保留', group: '管理员高级授权' },
+  { value: 'settlementAdjust', title: '已结算金额更正', description: '追加已结算陪玩金额的差额更正，保留原结算记录', group: '管理员高级授权' }
 ];
+const staffPermissionGroups = computed(() => ['基础工作权限', '订单处理直办', '资料处理直办', '资金处理直办'].map(title => ({ title, options: permissionOptions.filter(option => option.group === title) })));
+const specialPermissionOptions = permissionOptions.filter(option => option.group === '管理员高级授权');
+const canGrant = (permission: Permission) => hasDirectPermission(state.user, permission);
+const canResetAccountPassword = (account: Account) => canEditAccount(account) && (isRoot.value || account.role !== 'admin' || specialPermissionOptions.every(option => !account.permissions.includes(option.value) || canGrant(option.value)));
+const adminAuthorizationSummary = (account: Account) => [account.canManageAdmins ? '管理员账号管理' : '', ...specialPermissionOptions.filter(option => account.permissions.includes(option.value)).map(option => option.title)].filter(Boolean).join('、') || '高级事项需申请';
+const protectedRole = computed(() => { const account = state.accounts.find(entry => entry.id === form.id); return !isRoot.value && account?.role === 'admin' && (account.canManageAdmins || specialPermissionOptions.some(option => account.permissions.includes(option.value))); });
+const canSetFormPassword = computed(() => { const account = state.accounts.find(entry => entry.id === form.id); return !account || canResetAccountPassword(account); });
 const rules = {
   username: [{ required: true, message: '请输入登录名', trigger: 'blur' }, { pattern: /^[a-zA-Z0-9_-]{3,32}$/, message: '使用3至32位字母、数字、下划线或短横线', trigger: 'blur' }],
   name: [{ required: true, message: '请输入工作昵称', trigger: 'blur' }]
 };
 const openAccount = (account?: Account) => {
   if (account && !canEditAccount(account)) return ElMessage.warning(account.role === 'root' ? 'root 账号由系统保护，请在右上角修改自己的密码' : '尚未获准管理其他管理员账号');
-  Object.assign(form, account ? { id: account.id, username: account.username, name: account.name, role: account.role, permissions: [...account.permissions], active: account.active, canManageAdmins: account.canManageAdmins === true, password: '' } : { id: '', username: '', name: '', password: '', role: 'staff', permissions: ['recharge', 'payment', 'refund', 'players'], canManageAdmins: false, active: true });
+  Object.assign(form, account ? { id: account.id, username: account.username, name: account.name, role: account.role, permissions: [...account.permissions], active: account.active, canManageAdmins: account.canManageAdmins === true, password: '', version: account.version } : { id: '', username: '', name: '', password: '', role: 'staff', permissions: ['recharge', 'payment', 'refund', 'players'], canManageAdmins: false, active: true, version: undefined });
   drawer.value = true;
 };
 const saveAccount = async () => {
@@ -41,26 +62,31 @@ const saveAccount = async () => {
   if ((!form.id || form.password) && (form.password.length < 10 || !/[a-zA-Z]/.test(form.password) || !/[0-9]/.test(form.password))) return ElMessage.warning('密码至少10位，需包含字母和数字');
   saving.value = true;
   try {
-    const body: Record<string, unknown> = { username: form.username, name: form.name, role: form.role, permissions: form.role === 'staff' ? form.permissions : [], active: form.active };
+    const body: Record<string, unknown> = { username: form.username, name: form.name, role: form.role, active: form.active };
+    if (form.id && form.version !== undefined) body.version = form.version;
+    if (form.role === 'staff') body.permissions = form.permissions.filter(permission => !specialPermissionOptions.some(option => option.value === permission));
+    else if (form.role === 'shareholder') body.permissions = [];
+    else if (isRoot.value) body.permissions = form.permissions.filter(permission => specialPermissionOptions.some(option => option.value === permission));
     if (form.password) body.password = form.password;
     if (isRoot.value && form.role === 'admin') body.canManageAdmins = form.canManageAdmins;
     await api(form.id ? `/api/accounts/${form.id}` : '/api/accounts', { method: form.id ? 'PUT' : 'POST', body: JSON.stringify(body) });
-    await refresh(); drawer.value = false; ElMessage.success(form.id ? '账号授权已更新' : '账号已创建');
+    drawer.value = false; ElMessage.success(form.id ? '账号授权已更新' : '账号已创建');
+    await refresh().catch(() => ElMessage.warning('账号已保存，列表刷新失败，请点击刷新查看最新数据'));
   } catch (e) { notifyError(e); } finally { saving.value = false; }
 };
 const toggleAccount = async (account: Account) => {
   if (!canEditAccount(account)) return;
   if (!await confirmAction(`${account.active ? '停用' : '启用'}“${account.name}”的账号？${account.active ? '现有登录将失效，历史记录保留。' : ''}`)) return;
-  try { await api(`/api/accounts/${account.id}`, { method: 'PUT', body: JSON.stringify({ active: !account.active }) }); await refresh(); ElMessage.success('账号状态已更新'); } catch (e) { notifyError(e); }
+  try { await api(`/api/accounts/${account.id}`, { method: 'PUT', body: JSON.stringify({ active: !account.active, version: account.version }) }); ElMessage.success('账号状态已更新'); await refresh().catch(() => ElMessage.warning('账号状态已保存，列表刷新失败，请点击刷新')); } catch (e) { notifyError(e); }
 };
 const resetDialog = ref(false);
 const resetTarget = ref<Account | null>(null);
 const newPassword = ref('');
 const resetPassword = async () => {
-  if (!resetTarget.value || !canEditAccount(resetTarget.value)) return;
+  if (!resetTarget.value || !canResetAccountPassword(resetTarget.value)) return;
   if ((newPassword.value.length < 10 || !/[a-zA-Z]/.test(newPassword.value) || !/[0-9]/.test(newPassword.value))) return ElMessage.warning('新密码至少10位，需包含字母和数字');
   saving.value = true;
-  try { const a = resetTarget.value; await api(`/api/accounts/${a.id}`, { method: 'PUT', body: JSON.stringify({ password: newPassword.value }) }); await refresh(); resetDialog.value = false; ElMessage.success('密码已重置，原登录已失效'); } catch (e) { notifyError(e); } finally { saving.value = false; }
+  try { const a = resetTarget.value; await api(`/api/accounts/${a.id}`, { method: 'PUT', body: JSON.stringify({ password: newPassword.value, version: a.version }) }); resetDialog.value = false; ElMessage.success('密码已重置，原登录已失效'); await refresh().catch(() => ElMessage.warning('密码已重置，列表刷新失败，请点击刷新')); } catch (e) { notifyError(e); } finally { saving.value = false; }
 };
 const auditQuery = ref('');
 const actor = ref('');
@@ -115,16 +141,16 @@ const formatDate = (value?: string) => value ? new Date(value).toLocaleString('z
     <div class="page-head"><div><h1 class="page-title">账号与审计</h1><p class="page-subtitle">每位伙伴独立工作，每次关键操作都有记录。</p></div><el-button :icon="Refresh" @click="refresh().catch(notifyError)">刷新</el-button></div>
     <el-tabs v-model="tab" class="management-tabs"><el-tab-pane label="账号与授权" name="accounts">
       <section class="panel account-panel">
-        <div class="toolbar"><div class="filters"><el-input v-model="query" placeholder="搜索昵称、登录名" :prefix-icon="Search" clearable style="width:240px" /><el-select v-model="roleFilter" placeholder="全部角色" clearable style="width:145px"><el-option label="root 管理员" value="root" /><el-option label="管理员" value="admin" /><el-option label="客服" value="staff" /><el-option label="股东" value="shareholder" /></el-select></div><el-button type="primary" :icon="Plus" @click="openAccount()">新增账号</el-button></div>
+        <div class="toolbar"><div class="filters"><el-input v-model="query" placeholder="搜索昵称、登录名" :prefix-icon="Search" clearable style="width:240px" /><el-select v-model="roleFilter" placeholder="全部角色" clearable style="width:145px"><el-option label="root 管理员" value="root" /><el-option label="管理员" value="admin" /><el-option label="客服" value="staff" /><el-option label="股东" value="shareholder" /></el-select><el-radio-group v-model="accountScope" size="small"><el-radio-button value="normal">正常账号</el-radio-button><el-radio-button value="deleted">回收站</el-radio-button></el-radio-group></div><el-button type="primary" :icon="Plus" @click="openAccount()">新增账号</el-button></div>
         <el-table :data="accountRows" empty-text="没有匹配的账号">
           <el-table-column label="工作人员" min-width="150"><template #default="{ row }"><div class="person-cell"><div class="person-avatar">{{ row.name.slice(0, 1) }}</div><div><strong>{{ row.name }}</strong><span>{{ row.username }}</span></div><el-tag v-if="row.id === state.user?.id" size="small" type="info">我</el-tag></div></template></el-table-column>
           <el-table-column label="角色" width="135"><template #default="{ row }"><el-tag :type="row.role === 'root' ? 'danger' : row.role === 'admin' ? 'primary' : row.role === 'shareholder' ? 'warning' : 'info'" effect="light">{{ roleLabel(row.role) }}</el-tag></template></el-table-column>
-          <el-table-column label="授权范围" min-width="270"><template #default="{ row }"><span v-if="row.role === 'root'" class="muted">全部业务及管理员账号管理</span><span v-else-if="row.role === 'admin'" class="muted">全部业务权限 · {{ row.canManageAdmins ? '可管理其他管理员' : '管理客服及股东账号' }}</span><span v-else-if="row.role === 'shareholder'" class="muted">数据报表</span><div v-else class="permissions-tags"><el-tag v-for="p in row.permissions" :key="p" size="small" type="info" effect="plain">{{ permissionOptions.find(o => o.value === p)?.title || p }}</el-tag><span v-if="!row.permissions.length" class="muted">日常建档、报价与派单</span></div></template></el-table-column>
-          <el-table-column label="状态" width="90"><template #default="{ row }"><span class="status-dot" :class="{ inactive: !row.active }"></span>{{ row.active ? '已启用' : '已停用' }}</template></el-table-column>
+          <el-table-column label="授权范围" min-width="270"><template #default="{ row }"><span v-if="row.role === 'root'" class="muted">全部业务及高级授权管理</span><span v-else-if="row.role === 'admin'" class="muted">普通业务直办 · {{ adminAuthorizationSummary(row) }}</span><span v-else-if="row.role === 'shareholder'" class="muted">数据报表</span><div v-else class="permissions-tags"><el-tag v-for="p in row.permissions" :key="p" size="small" type="info" effect="plain">{{ permissionOptions.find(o => o.value === p)?.title || p }}</el-tag><span v-if="!row.permissions.length" class="muted">日常建档、报价与派单；超权限事项可申请</span></div></template></el-table-column>
+          <el-table-column label="状态" width="90"><template #default="{ row }"><span class="status-dot" :class="{ inactive: !row.active }"></span>{{ row.deletedAt ? '已删除' : row.active ? '已启用' : '已停用' }}</template></el-table-column>
           <el-table-column label="最近登录" min-width="165"><template #default="{ row }"><span class="date-text">{{ formatDate(row.lastLogin) }}</span></template></el-table-column>
-          <el-table-column label="操作" width="215" fixed="right"><template #default="{ row }"><template v-if="canEditAccount(row)"><el-button link type="primary" @click="openAccount(row)">编辑与授权</el-button><el-button link type="primary" @click="resetTarget = row; newPassword = ''; resetDialog = true">重置密码</el-button><el-button link :type="row.active ? 'danger' : 'success'" @click="toggleAccount(row)">{{ row.active ? '停用' : '启用' }}</el-button></template><span v-else class="muted">{{ row.role === 'root' ? '系统预置账号' : '需 root 授权管理' }}</span></template></el-table-column>
+          <el-table-column label="操作" width="280" fixed="right"><template #default="{ row }"><template v-if="!row.deletedAt && canEditAccount(row)"><el-button link type="primary" @click="openAccount(row)">编辑与授权</el-button><el-tooltip :disabled="canResetAccountPassword(row)" content="目标拥有当前账号未持有的高级权限，需由 root 或具备对应权限的管理员重置"><span><el-button link type="primary" :disabled="!canResetAccountPassword(row)" @click="resetTarget = row; newPassword = ''; resetDialog = true">重置密码</el-button></span></el-tooltip><el-button link :type="row.active ? 'danger' : 'success'" @click="toggleAccount(row)">{{ row.active ? '停用' : '启用' }}</el-button></template><span v-else-if="row.role === 'root'" class="muted">系统预置账号</span><el-button v-if="row.role !== 'root' && row.id !== state.user.id" link :type="row.deletedAt ? 'success' : 'danger'" @click="openAccountLifecycle(row)">{{ row.deletedAt ? '恢复' : '删除与交接' }}</el-button></template></el-table-column>
         </el-table>
-        <div class="panel-note"><el-icon><Lock /></el-icon>停用账号会使已有登录失效，历史订单及操作者记录继续保留。root 账号不可停用或降级。</div>
+        <div class="panel-note"><el-icon><Lock /></el-icon>停用立即使登录失效；删除前核对业务交接，历史记录保留。回收站恢复后仍需启用账号。root 账号受保护。</div>
       </section>
     </el-tab-pane>
     <el-tab-pane label="操作审计" name="audit"><section class="panel audit-panel"><div class="audit-intro"><div><strong>业务操作轨迹</strong><p>日志由系统自动记录，管理员也没有编辑或删除入口。</p></div><el-dropdown @command="exportAudit"><el-button :icon="Download">导出筛选结果</el-button><template #dropdown><el-dropdown-menu><el-dropdown-item command="xlsx">Excel 文件</el-dropdown-item><el-dropdown-item command="csv">CSV 文件</el-dropdown-item></el-dropdown-menu></template></el-dropdown></div><div class="audit-filters"><el-date-picker v-model="range" type="daterange" value-format="YYYY-MM-DD" start-placeholder="开始日期" end-placeholder="结束日期" range-separator="至" style="width:260px;flex-grow:0" /><el-select v-model="actor" clearable placeholder="全部操作者" style="width:140px"><el-option v-for="a in actors" :key="a.id" :label="a.name" :value="a.id" /></el-select><el-select v-model="action" clearable placeholder="全部操作" style="width:160px"><el-option v-for="a in actions" :key="a" :label="a" :value="a" /></el-select><el-select v-model="result" clearable placeholder="全部结果" style="width:120px"><el-option label="成功" value="success" /><el-option label="失败" value="failed" /><el-option label="未授权" value="denied" /></el-select><el-input v-model="auditQuery" :prefix-icon="Search" clearable placeholder="搜索单据、客户或原因" style="width:230px" /></div><el-table :data="auditRows" row-key="id" empty-text="此筛选条件下暂无记录"><el-table-column type="expand"><template #default="{ row }"><div class="audit-detail"><div class="detail-meta"><span>事件编号：{{ row.id }}</span><span>关联记录：{{ row.targetId }}</span><span>来源地址：{{ row.ip || '本地服务' }}</span></div><p v-if="row.reason" class="audit-reason">处理说明：{{ row.reason }}</p><el-table v-if="changes(row).length" :data="changes(row)" border size="small"><el-table-column prop="label" label="变更字段" width="150" /><el-table-column label="操作前"><template #default="{ row: field }"><pre>{{ field.before }}</pre></template></el-table-column><el-table-column label="操作后"><template #default="{ row: field }"><pre>{{ field.after }}</pre></template></el-table-column></el-table><span v-else class="muted">此事件没有字段变更。</span></div></template></el-table-column><el-table-column label="时间" min-width="170"><template #default="{ row }"><span class="date-text">{{ formatDate(row.createdAt) }}</span></template></el-table-column><el-table-column prop="actorName" label="操作者" min-width="100" /><el-table-column prop="action" label="操作" min-width="150" /><el-table-column label="关联业务" min-width="180"><template #default="{ row }"><strong class="target-name">{{ row.targetName || businessLabel(row.targetType) }}</strong><span class="target-type">{{ businessLabel(row.targetType) }}</span></template></el-table-column><el-table-column prop="reason" label="说明" min-width="170" show-overflow-tooltip /><el-table-column label="结果" width="90"><template #default="{ row }"><el-tag :type="['success', '成功'].includes(row.result) ? 'success' : 'danger'" size="small">{{ ['success', '成功'].includes(row.result) ? '成功' : '失败' }}</el-tag></template></el-table-column></el-table><div class="panel-note">当前显示 {{ auditRows.length }} 条记录。点击左侧箭头查看修改前后值。</div></section></el-tab-pane></el-tabs>
@@ -133,16 +159,17 @@ const formatDate = (value?: string) => value ? new Date(value).toLocaleString('z
         <div class="form-section-label"><el-icon><User /></el-icon>账号资料</div>
         <el-form-item label="登录名" prop="username"><el-input v-model="form.username" :disabled="!!form.id" placeholder="例如 kefu02" maxlength="32" /></el-form-item>
         <el-form-item label="工作昵称" prop="name"><el-input v-model="form.name" placeholder="用于订单和操作记录展示" maxlength="30" /></el-form-item>
-        <el-form-item :label="form.id ? '新密码（不修改请留空）' : '初始密码'" :required="!form.id"><el-input v-model="form.password" type="password" show-password autocomplete="new-password" placeholder="至少10位，包含字母和数字" /></el-form-item>
-        <el-form-item label="角色"><el-radio-group v-model="form.role"><el-radio-button v-for="option in accountRoleOptions" :key="option.value" :value="option.value">{{ option.label }}</el-radio-button></el-radio-group></el-form-item>
-        <template v-if="form.role === 'admin'"><el-alert title="管理员拥有全部业务权限，可管理客服及股东账号。" type="info" :closable="false" show-icon /><el-form-item v-if="isRoot" class="admin-management-option"><el-checkbox v-model="form.canManageAdmins">允许管理其他管理员账号</el-checkbox><p class="permission-description">允许新增、编辑、停用及重置其他普通管理员的密码。此授权仅由 root 设置。</p></el-form-item><p v-else class="permission-description admin-management-option">管理员账号管理权限由 root 设置，当前{{ form.canManageAdmins ? '已开通' : '未开通' }}。</p></template>
+        <el-form-item :label="form.id ? '新密码（不修改请留空）' : '初始密码'" :required="!form.id"><el-input v-model="form.password" :disabled="!canSetFormPassword" type="password" show-password autocomplete="new-password" placeholder="至少10位，包含字母和数字" /><p v-if="!canSetFormPassword" class="permission-description">目标拥有当前账号未持有的高级权限，请由 root 或具备对应权限的管理员重置密码。</p></el-form-item>
+        <el-form-item label="角色"><el-radio-group v-model="form.role" :disabled="protectedRole"><el-radio-button v-for="option in accountRoleOptions" :key="option.value" :value="option.value">{{ option.label }}</el-radio-button></el-radio-group><p v-if="protectedRole" class="permission-description">该账号拥有 root 授予的高级权限，角色变更需由 root 处理。</p></el-form-item>
+        <template v-if="form.role === 'admin'"><el-alert title="管理员默认可直接处理普通业务；高级事项未授权时可以申请。" type="info" :closable="false" show-icon /><div class="form-section-label permission-heading"><el-icon><Lock /></el-icon>管理员高级直办授权</div><p class="permission-description">以下权限仅由 root 授予或收回，管理员不能继续转授。获得直办权后，也可审核其他人的对应申请。</p><el-checkbox-group v-model="form.permissions" class="permission-list"><el-checkbox v-for="option in specialPermissionOptions" :key="option.value" :value="option.value" :disabled="!isRoot"><span><strong>{{ option.title }}</strong><small>{{ option.description }}</small></span></el-checkbox></el-checkbox-group><el-form-item class="admin-management-option"><el-checkbox v-model="form.canManageAdmins" :disabled="!isRoot">允许管理其他管理员账号</el-checkbox><p class="permission-description">允许新增、编辑、停用、重置密码及按规则删除其他管理员；不能修改 root 或转授高级权限。</p></el-form-item></template>
         <el-alert v-else-if="form.role === 'shareholder'" title="股东登录后进入数据报表。" type="info" :closable="false" show-icon />
-        <template v-else-if="form.role === 'staff'"><div class="form-section-label permission-heading"><el-icon><Lock /></el-icon>特殊操作授权</div><p class="permission-description">客户建档、报价与派单为日常权限，以下项目分别授权。</p><el-checkbox-group v-model="form.permissions" class="permission-list"><el-checkbox v-for="option in permissionOptions" :key="option.value" :value="option.value"><span><strong>{{ option.title }}</strong><small>{{ option.description }}</small></span></el-checkbox></el-checkbox-group></template>
+        <template v-else-if="form.role === 'staff'"><p class="permission-description permission-heading">客户建档、报价与派单为日常权限。直办项目未勾选时可提交申请；基础工作项目未授权时不能办理。客服直办不包含审核他人的权限。</p><section v-for="group in staffPermissionGroups" :key="group.title" class="permission-group"><div class="form-section-label permission-heading"><el-icon><Lock /></el-icon>{{ group.title }}</div><el-checkbox-group v-model="form.permissions" class="permission-list"><el-checkbox v-for="option in group.options" :key="option.value" :value="option.value" :disabled="!canGrant(option.value)"><span><strong>{{ option.title }}</strong><small>{{ option.description }}{{ option.requestable ? '；未勾选需申请' : '' }}</small></span></el-checkbox></el-checkbox-group></section></template>
         <el-form-item label="账号状态" style="margin-top:20px"><el-switch v-model="form.active" active-text="启用" inactive-text="停用" /></el-form-item>
       </el-form>
       <template #footer><el-button @click="drawer = false">取消</el-button><el-button type="primary" :loading="saving" @click="saveAccount">保存账号</el-button></template>
     </el-drawer>
     <el-dialog v-model="resetDialog" title="重置登录密码" width="420px"><p class="reset-note">为 {{ resetTarget?.name }} 设置新密码，原有登录会立即失效。</p><el-input v-model="newPassword" type="password" show-password autocomplete="new-password" placeholder="至少10位，包含字母和数字" /><template #footer><el-button @click="resetDialog = false">取消</el-button><el-button type="primary" :icon="Key" :loading="saving" @click="resetPassword">确认重置</el-button></template></el-dialog>
+    <WorkflowAction ref="workflow" />
   </div>
   <el-result v-else icon="warning" title="此页面仅管理员可访问" sub-title="请使用管理员账号查看账号授权和全局审计记录。" />
 </template>

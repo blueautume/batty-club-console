@@ -16,6 +16,7 @@ const router=createRouter({history:createWebHistory(),routes:[
   {path:'/quotes',component:()=>import('./views/QuotesView.vue')},
   {path:'/quote-drafts',component:()=>import('./views/QuoteDraftsView.vue')},
   {path:'/orders',component:()=>import('./views/OrdersView.vue')},
+  {path:'/approvals',component:()=>import('./views/ApprovalsView.vue')},
   {path:'/reports',component:()=>import('./views/ReportsView.vue')},
   {path:'/management',component:()=>import('./views/ManagementView.vue')},
   {path:'/settings',component:()=>import('./views/SettingsView.vue')},

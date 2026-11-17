@@ -1,10 +1,11 @@
 export type LeaveReason = 'navigation' | 'logout';
 type EditorLeaveGuard = (reason: LeaveReason) => Promise<boolean>;
-let current: EditorLeaveGuard | null = null;
+const guards = new Set<EditorLeaveGuard>();
 export function registerEditorLeaveGuard(guard: EditorLeaveGuard): () => void {
-  current = guard;
-  return () => { if (current === guard) current = null; };
+  guards.add(guard);
+  return () => { guards.delete(guard); };
 }
 export async function requestEditorLeave(reason: LeaveReason = 'navigation'): Promise<boolean> {
-  return current ? current(reason) : true;
+  for (const guard of [...guards]) if (!await guard(reason)) return false;
+  return true;
 }

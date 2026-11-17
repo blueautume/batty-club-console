@@ -167,7 +167,7 @@ describe('真实后端关键业务流程', { concurrency: false }, () => {
       const key = crypto.randomUUID(); const body = { amountCents: 10000, channel: '微信', reference: 'PRINCIPAL-REFUND', reason: '客户申请退还未消费本金', idempotencyKey: key, rechargeId: recharge.data.id };
       assert.equal((await f.request(`/api/customers/${c.id}/wallet-refund`, body)).status, 201);
       assert.equal((await f.request(`/api/customers/${c.id}/wallet-refund`, body)).status, 409);
-      assert.equal((await f.request(`/api/customers/${c.id}/wallet-refund`, { ...body, amountCents: 30000, idempotencyKey: crypto.randomUUID(), reference: 'TOO-MUCH' })).status, 400);
+      assert.equal((await f.request(`/api/customers/${c.id}/wallet-refund`, { ...body, amountCents: 30000, idempotencyKey: crypto.randomUUID(), reference: 'TOO-MUCH' })).status, 409);
       let state = await f.bootstrap(); assert.equal(state.customers.find((x: any) => x.id === c.id).balanceCents, 28000); assert.equal(state.ledger.filter((x: any) => x.customerId === c.id && x.type === '充值本金退款').length, 1);
       assert.equal(state.dashboard.cashReceivedCents, 40000); assert.equal(state.dashboard.orderTotalCents, 12000); assert.equal(state.dashboard.externalRefundCents, 10000);
       await f.login('kefu', 'Staff2026!'); assert.equal((await f.request(`/api/customers/${c.id}/wallet-refund`, { ...body, idempotencyKey: crypto.randomUUID(), reference: 'STAFF-DENIED' })).status, 403);
@@ -188,6 +188,10 @@ describe('真实后端关键业务流程', { concurrency: false }, () => {
       await f.login(); const c = await f.customer(); await f.recharge(c.id, 50000); const o = await f.order(c.id, [f.item(), f.item({ tier: '娱乐陪' })]); await f.pay(o.id, 18000);
       const player = (await f.bootstrap()).players.find((p: any) => p.status === 'available' && p.capabilities.some((cap: any) => cap.mode === '机密' && cap.tier === '技术陪'));
       const assigned = await f.request(`/api/orders/${o.id}/assign`, { itemId: o.items[0].id, playerId: player.id }); await f.request(`/api/orders/${o.id}/assignment/${assigned.data.assignments[0].id}`, { action: 'start' });
+      // A staff refund remains limited to their own assigned business.
+      const beforeTransfer = (await f.bootstrap()).customers.find((customer: any) => customer.id === c.id);
+      assert.equal((await f.request(`/api/customers/${c.id}`, { version: beforeTransfer.version, ownerId: 'staff-demo' }, 'PUT')).status, 200);
+      assert.equal((await f.request(`/api/orders/${o.id}/owner`, { ownerId: 'staff-demo', reason: '交接给负责此售后的客服' })).status, 200);
       await f.login('kefu', 'Staff2026!');
       assert.equal((await f.request(`/api/orders/${o.id}/refund`, { walletCents: 6001, externalCents: 0, reason: '超过未开始娱乐服务金额', idempotencyKey: crypto.randomUUID() })).status, 403);
       assert.equal((await f.request(`/api/orders/${o.id}/refund`, { walletCents: 3000, externalCents: 0, reason: '未开始娱乐服务部分取消', idempotencyKey: crypto.randomUUID() })).status, 200);

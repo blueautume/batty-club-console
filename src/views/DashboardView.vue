@@ -3,7 +3,7 @@ import { isAdminRole } from '../../shared/roles';
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { Plus, ArrowRight, Refresh, Clock, User, Tickets, Headset, Wallet, TrendCharts } from '@element-plus/icons-vue';
-import { state, refresh } from '../lib/store';
+import { state, refresh, orderProgress } from '../lib/store';
 import { money, notifyError } from '../lib/api';
 import type { Order } from '../../shared/types';
 
@@ -30,17 +30,7 @@ const reminders = computed(() => state.orders.flatMap((order: Order) => order.as
   return { order, assignment: a, remaining: Math.ceil((end - now.value) / 60000) };
 })).filter(r => r.remaining <= 10).sort((a, b) => a.remaining - b.remaining).slice(0, 5));
 const recentEvents = computed(() => state.audit.slice(0, 5));
-const serviceLabel = (order: Order) => {
-  if (order.status === 'cancelled') return '已取消';
-  if (order.status === 'draft') return '待客户确认';
-  if (order.status === 'confirmed') return '待结清';
-  const assignments = order.assignments.filter(a => !['replaced', 'cancelled'].includes(a.status));
-  if (assignments.length && assignments.every(a => a.status === 'completed') && assignments.length >= order.items.length) return '已完成';
-  if (assignments.some(a => a.status === 'serving')) return '服务中';
-  if (!assignments.length) return '待派单';
-  if (assignments.length < order.items.length) return '部分派单';
-  return '待服务';
-};
+const serviceLabel = orderProgress;
 const reload = async () => { loading.value = true; try { await refresh(); } catch (e) { notifyError(e); } finally { loading.value = false; } };
 const cards = computed(() => [
   { title: '客户档案', value: state.dashboard?.customers || 0, sub: '会员与消费记录统一管理', icon: User, color: 'violet', path: '/customers' },

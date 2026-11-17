@@ -7,10 +7,16 @@ import type { Customer, Membership, Order, Recharge } from '../../shared/types';
 import { api, money, notifyError, exportFile } from '../lib/api';
 import { state, refresh, can } from '../lib/store';
 import { registerEditorLeaveGuard } from '../lib/leaveGuard';
+import WorkflowAction from '../components/WorkflowAction.vue';
+import type { WorkflowPlan } from '../../shared/workflow';
 import MemberBadge from '../components/MemberBadge.vue';
 
 const route = useRoute();
 const router = useRouter();
+const workflow = ref<InstanceType<typeof WorkflowAction>>();
+const recordFilter = ref('active');
+function canHandleCustomer(customer: Customer) { return isAdmin.value || customer.ownerId === state.user.id; }
+function recordAction(action: WorkflowPlan['action'], customer: Customer) { workflow.value?.open({action,targetId:customer.id,reason:''}); }
 const search = ref('');
 const memberFilter = ref('');
 const activeTab = ref(String(route.query.tab || 'customers'));
@@ -38,14 +44,10 @@ const memberForm = reactive({ member: '普通客户' as Membership, benefit: 'no
 const rechargeOpen = ref(false);
 const rechargeCustomerId = ref('');
 const recharge = reactive({ amount: 0, kind: 'initial', member: '普通客户' as Membership, benefit: 'none', channel: '微信转账', reference: '', note: '', exceptionReason: '' });
-const walletRefundOpen = ref(false);
-const walletRefundCustomerId = ref('');
-const walletRefundCustomer = computed(() => state.customers.find(c => c.id === walletRefundCustomerId.value));
-const walletRefund = reactive({ amount: 0, channel: '微信转账', reference: '', reason: '', rechargeId: '', actualRefundConfirmed: false, idempotencyKey: '' });
-const walletRefundSources = computed(() => state.recharges.filter(r => r.customerId === walletRefundCustomerId.value && !r.reversed));
 const dateRange = ref<string[]>([]);
 const ledgerSearch = ref('');
 const ledgerType = ref('');
+const activeStaff = computed(() => state.accounts.filter(a => a.active && !a.deletedAt && a.role !== 'shareholder'));
 const isAdmin = computed(() => isAdminRole(state.user?.role));
 const selected = computed(() => state.customers.find(c => c.id === detailId.value));
 const rechargeCustomer = computed(() => state.customers.find(c => c.id === rechargeCustomerId.value));
@@ -53,7 +55,8 @@ const memberCount = computed(() => state.customers.filter(c => c.member !== '普
 const balanceTotal = computed(() => state.customers.reduce((sum, c) => sum + c.balanceCents, 0));
 const filteredCustomers = computed(() => state.customers.filter(c => {
   const term = search.value.trim().toLowerCase();
-  return (!term || `${c.name} ${c.code} ${c.contact} ${c.tags.join(' ')}`.toLowerCase().includes(term)) && (!memberFilter.value || c.member === memberFilter.value);
+  const lifecycle = recordFilter.value === 'deleted' ? !!c.deletedAt : recordFilter.value === 'archived' ? !c.deletedAt && (!!c.archivedAt || !c.active) : !c.deletedAt && !c.archivedAt && c.active;
+  return lifecycle && (!term || `${c.name} ${c.code} ${c.contact} ${c.tags.join(' ')}`.toLowerCase().includes(term)) && (!memberFilter.value || c.member === memberFilter.value);
 }));
 const duplicateCustomer = computed(() => form.contact.trim() ? state.customers.find(c => c.id !== editing.value?.id && c.contact === form.contact.trim()) : undefined);
 const selectedLedger = computed(() => state.ledger.filter(l => l.customerId === detailId.value));
@@ -135,7 +138,7 @@ async function saveCustomer(startOrder = false) {
   const edited = editing.value;
   const returnDraftId = returningToQuote.value ? quoteDraftId.value : '';
   const duplicate = duplicateCustomer.value;
-  const payload = { name: form.name.trim(), contactType: form.contactType, contact: form.contact.trim(), source: form.source.trim(), tags: form.tagsText.split(/[,，]/).map(t => t.trim()).filter(Boolean).slice(0, 12), notes: form.notes, ownerId: form.ownerId, active: form.active, ...(edited ? { version: edited.version } : {}) };
+  const payload = { name: form.name.trim(), contactType: form.contactType, contact: form.contact.trim(), source: form.source.trim(), tags: form.tagsText.split(/[,，]/).map(t => t.trim()).filter(Boolean).slice(0, 12), notes: form.notes, ownerId: form.ownerId, ...(edited ? { version: edited.version } : {}) };
   try {
     if (duplicate) {
       try { await ElMessageBox.confirm(`号码与「${duplicate.name}」重复，请确认是独立客户后继续。`, '核对客户信息', { type: 'warning', confirmButtonText: '确认继续', cancelButtonText: '返回核对' }); } catch { return; }
@@ -194,34 +197,8 @@ async function submitRecharge() {
     await refresh(true); rechargeOpen.value = false; ElMessage.success('充值到账已登记，余额和会员记录已更新');
   } catch (error) { notifyError(error); } finally { busy.value = false; }
 }
-async function reverseRecharge(item: Recharge) {
-  try {
-    const { value } = await ElMessageBox.prompt('请记录误登记原因。系统会生成反向流水；涉及会员资格需另行核实。', '撤销充值登记', { inputType: 'textarea', inputValidator: value => !!value?.trim() || '请填写处理原因', confirmButtonText: '确认撤销', cancelButtonText: '取消', type: 'warning' });
-    busy.value = true;
-    await api(`/api/recharges/${item.id}/reverse`, { method: 'POST', body: JSON.stringify({ reason: value }) });
-    await refresh(true); ElMessage.success('充值已冲回，原记录继续保留');
-  } catch (error) { if (error !== 'cancel' && error !== 'close') notifyError(error); } finally { busy.value = false; }
-}
-function openWalletRefund(customer: Customer) {
-  walletRefundCustomerId.value = customer.id;
-  Object.assign(walletRefund, { amount: 0, channel: '微信转账', reference: '', reason: '', rechargeId: '', actualRefundConfirmed: false, idempotencyKey: crypto.randomUUID() });
-  walletRefundOpen.value = true;
-}
-async function submitWalletRefund() {
-  const customer = walletRefundCustomer.value;
-  if (!customer || !isAdmin.value) return;
-  const amountCents = Math.round(walletRefund.amount * 100);
-  if (!Number.isSafeInteger(amountCents) || amountCents <= 0) { ElMessage.warning('请填写实际退还的本金金额'); return; }
-  if (amountCents > customer.balanceCents) { ElMessage.warning('退款金额不能超过客户当前可用余额'); return; }
-  if (!walletRefund.reference.trim() || !walletRefund.reason.trim()) { ElMessage.warning('请填写实际退款参考号和退款原因'); return; }
-  if (!walletRefund.actualRefundConfirmed) { ElMessage.warning('请先核实已在线下实际完成退款，再勾选确认'); return; }
-  busy.value = true;
-  try {
-    await api(`/api/customers/${customer.id}/wallet-refund`, { method: 'POST', body: JSON.stringify({ amountCents, channel: walletRefund.channel, reference: walletRefund.reference.trim(), reason: walletRefund.reason.trim(), idempotencyKey: walletRefund.idempotencyKey, ...(walletRefund.rechargeId ? { rechargeId: walletRefund.rechargeId } : {}) }) });
-    await refresh(true); walletRefundOpen.value = false;
-    ElMessage.success('本金退款已登记，余额流水已更新；请继续核实会员资格');
-  } catch (error) { notifyError(error); } finally { busy.value = false; }
-}
+function reverseRecharge(item: Recharge) { workflow.value?.open({action:'rechargeReverse',targetId:item.id,reason:''}); }
+function openWalletRefund(customer: Customer) { workflow.value?.open({action:'walletRefund',targetId:customer.id,reason:'',externalCents:0}); }
 async function download(type: string, format: 'xlsx' | 'csv' = 'xlsx') {
   try { await exportFile(type, format, { from: dateRange.value?.[0] || '', to: dateRange.value?.[1] || '' }); } catch (error) { notifyError(error); }
 }
@@ -243,7 +220,7 @@ async function download(type: string, format: 'xlsx' | 'csv' = 'xlsx') {
         <el-tab-pane label="客户档案" name="customers">
           <div class="toolbar customer-toolbar">
             <el-input v-model="search" clearable placeholder="搜索客户称呼、号码、编号或标签" class="search-input" />
-            <el-select v-model="memberFilter" clearable placeholder="全部会员等级" class="filter-select"><el-option v-for="m in memberships" :key="m" :label="m" :value="m"><MemberBadge :member="m" /></el-option></el-select>
+            <el-select v-model="recordFilter" class="filter-select"><el-option label="正常客户" value="active"/><el-option label="停用 / 已归档" value="archived"/><el-option label="回收站" value="deleted"/></el-select><el-select v-model="memberFilter" clearable placeholder="全部会员等级" class="filter-select"><el-option v-for="m in memberships" :key="m" :label="m" :value="m"><MemberBadge :member="m" /></el-option></el-select>
             <span class="toolbar-spacer" /><span class="muted result-count">共 {{ filteredCustomers.length }} 位客户</span>
             <el-button v-if="can('export')" @click="download('customers')">导出 Excel</el-button>
           </div>
@@ -254,7 +231,7 @@ async function download(type: string, format: 'xlsx' | 'csv' = 'xlsx') {
             <el-table-column label="可用余额" min-width="130" align="right"><template #default="{ row }"><strong class="money">{{ money(row.balanceCents) }}</strong></template></el-table-column>
             <el-table-column label="跟进客服" min-width="110"><template #default="{ row }">{{ staffName(row.ownerId) }}</template></el-table-column>
             <el-table-column label="最近下单" min-width="120"><template #default="{ row }"><span class="muted">{{ lastOrder(row.id) }}</span></template></el-table-column>
-            <el-table-column label="操作" min-width="200" fixed="right"><template #default="{ row }"><el-button link type="primary" @click="router.push({ path: '/quotes', query: { customerId: row.id } })">开单</el-button><el-button v-if="can('recharge')" link type="primary" @click="openRecharge(row)">充值</el-button><el-button link @click="showDetail(row.id)">详情</el-button><el-button link @click="openEditor(row)">编辑</el-button></template></el-table-column>
+            <el-table-column label="操作" min-width="200" fixed="right"><template #default="{ row }"><el-button v-if="row.active && !row.deletedAt && !row.archivedAt && canHandleCustomer(row)" link type="primary" @click="router.push({ path: '/quotes', query: { customerId: row.id } })">开单</el-button><el-button v-if="can('recharge') && row.active && !row.deletedAt && !row.archivedAt && canHandleCustomer(row)" link type="primary" @click="openRecharge(row)">充值</el-button><el-button link @click="showDetail(row.id)">详情</el-button><el-button v-if="canHandleCustomer(row) && !row.deletedAt" link @click="openEditor(row)">编辑</el-button></template></el-table-column>
           </el-table>
         </el-tab-pane>
         <el-tab-pane label="充值消费流水" name="ledger">
@@ -264,7 +241,7 @@ async function download(type: string, format: 'xlsx' | 'csv' = 'xlsx') {
         </el-tab-pane>
         <el-tab-pane label="充值登记" name="recharges">
           <div class="toolbar"><el-input v-model="ledgerSearch" clearable placeholder="搜索客户、参考号或经办人" class="search-input" /><el-date-picker v-model="dateRange" type="daterange" value-format="YYYY-MM-DD" start-placeholder="开始日期" end-placeholder="结束日期" range-separator="至" class="date-filter" /><span class="toolbar-spacer" /><el-button v-if="can('export')" @click="download('recharges')">导出 Excel</el-button></div>
-          <el-table :data="filteredRecharges" empty-text="暂无充值登记"><el-table-column label="到账登记时间" min-width="170"><template #default="{ row }">{{ dateTime(row.createdAt) }}</template></el-table-column><el-table-column prop="customerName" label="客户" min-width="115" /><el-table-column label="金额" min-width="120" align="right"><template #default="{ row }"><strong class="money">{{ money(row.amountCents) }}</strong></template></el-table-column><el-table-column label="用途" min-width="115"><template #default="{ row }">{{ rechargeLabel(row.kind) }}</template></el-table-column><el-table-column label="关联会员" min-width="110"><template #default="{ row }"><MemberBadge :member="row.member" /></template></el-table-column><el-table-column prop="channel" label="收款渠道" min-width="120" /><el-table-column prop="reference" label="转账参考号" min-width="160" show-overflow-tooltip /><el-table-column prop="actorName" label="经办人" min-width="100" /><el-table-column label="状态" min-width="90"><template #default="{ row }"><el-tag :type="row.reversed ? 'info' : 'success'" size="small">{{ row.reversed ? '已冲回' : '已入账' }}</el-tag></template></el-table-column><el-table-column v-if="isAdmin" label="处理" min-width="110" fixed="right"><template #default="{ row }"><el-button v-if="!row.reversed" link type="danger" :loading="busy" @click="reverseRecharge(row)">撤销登记</el-button></template></el-table-column></el-table>
+          <el-table :data="filteredRecharges" empty-text="暂无充值登记"><el-table-column label="到账登记时间" min-width="170"><template #default="{ row }">{{ dateTime(row.createdAt) }}</template></el-table-column><el-table-column prop="customerName" label="客户" min-width="115" /><el-table-column label="金额" min-width="120" align="right"><template #default="{ row }"><strong class="money">{{ money(row.amountCents) }}</strong></template></el-table-column><el-table-column label="用途" min-width="115"><template #default="{ row }">{{ rechargeLabel(row.kind) }}</template></el-table-column><el-table-column label="关联会员" min-width="110"><template #default="{ row }"><MemberBadge :member="row.member" /></template></el-table-column><el-table-column prop="channel" label="收款渠道" min-width="120" /><el-table-column prop="reference" label="转账参考号" min-width="160" show-overflow-tooltip /><el-table-column prop="actorName" label="经办人" min-width="100" /><el-table-column label="状态" min-width="90"><template #default="{ row }"><el-tag :type="row.reversed ? 'info' : 'success'" size="small">{{ row.reversed ? '已冲回' : '已入账' }}</el-tag></template></el-table-column><el-table-column label="处理" min-width="110" fixed="right"><template #default="{ row }"><el-button v-if="!row.reversed && (isAdmin || state.customers.find(c=>c.id===row.customerId)?.ownerId===state.user.id)" link type="danger" :loading="busy" @click="reverseRecharge(row)">更正 / 申请更正</el-button></template></el-table-column></el-table>
         </el-tab-pane>
       </el-tabs>
     </div>
@@ -276,10 +253,10 @@ async function download(type: string, format: 'xlsx' | 'csv' = 'xlsx') {
         <el-form-item label="客户称呼" required><el-input v-model="form.name" maxlength="40" show-word-limit placeholder="方便客服识别的称呼" /></el-form-item>
         <div class="form-grid contact-grid"><el-form-item label="号码类型" required><el-select v-model="form.contactType"><el-option v-for="type in contactTypes" :key="type" :label="type" :value="type" /></el-select></el-form-item><el-form-item label="联系号码" required><el-input v-model="form.contact" maxlength="80" placeholder="微信号、QQ或手机号码" /></el-form-item></div>
         <el-alert v-if="duplicateCustomer" :title="`已有客户「${duplicateCustomer.name}」使用相同号码，请核对。`" type="warning" :closable="false" show-icon class="form-alert" />
-        <div class="form-grid"><el-form-item label="客户来源"><el-select v-model="form.source" filterable allow-create clearable placeholder="选择或输入来源"><el-option v-for="source in ['朋友推荐', '社群', '小红书', '抖音', '自然咨询', '其他']" :key="source" :label="source" :value="source" /></el-select></el-form-item><el-form-item label="跟进客服"><el-select v-model="form.ownerId" clearable placeholder="选择跟进客服"><el-option v-for="s in state.staff" :key="s.id" :label="s.name" :value="s.id" /></el-select></el-form-item></div>
+        <div class="form-grid"><el-form-item label="客户来源"><el-select v-model="form.source" filterable allow-create clearable placeholder="选择或输入来源"><el-option v-for="source in ['朋友推荐', '社群', '小红书', '抖音', '自然咨询', '其他']" :key="source" :label="source" :value="source" /></el-select></el-form-item><el-form-item label="跟进客服"><el-select v-model="form.ownerId" :disabled="!isAdmin" clearable placeholder="选择跟进客服"><el-option v-for="s in (isAdmin ? activeStaff : [{id:state.user.id,name:state.user.name}])" :key="s.id" :label="s.name" :value="s.id" /></el-select></el-form-item></div>
         <el-form-item label="客户标签"><el-input v-model="form.tagsText" placeholder="例如：老客户，偏爱技术陪（用逗号分隔）" maxlength="150" /></el-form-item>
         <el-form-item label="内部备注"><el-input v-model="form.notes" type="textarea" :rows="4" maxlength="1000" show-word-limit placeholder="服务偏好、沟通事项等，仅后台可见" /></el-form-item>
-        <el-form-item v-if="editing" label="档案状态"><el-switch v-model="form.active" active-text="正常" inactive-text="停用" /></el-form-item>
+        <p v-if="editing" class="muted tiny">档案停用、归档与删除请在客户详情中处理，已有账目会继续保留。</p>
       </el-form>
       <template #footer><el-button :disabled="busy" @click="editorOpen = false">取消</el-button><template v-if="returningToQuote"><el-button :disabled="busy" @click="returnToQuoteDraft">返回原报价</el-button><el-button type="primary" :loading="busy" @click="saveCustomer(false)">保存并返回报价</el-button></template><template v-else><el-button :loading="busy" @click="saveCustomer(false)">保存档案</el-button><el-button type="primary" :loading="busy" @click="saveCustomer(true)">保存并开单</el-button></template></template>
     </el-drawer>
@@ -287,13 +264,13 @@ async function download(type: string, format: 'xlsx' | 'csv' = 'xlsx') {
     <el-drawer v-model="detailOpen" title="客户档案" size="min(1000px, 97vw)">
       <template v-if="selected">
         <div class="detail-hero"><span class="person-avatar large">{{ selected.name.slice(0, 1) }}</span><div><h2>{{ selected.name }} <MemberBadge :member="selected.member" size="default" /></h2><p>{{ selected.code }} · {{ selected.contactType }} {{ selected.contact }}</p><div class="tag-row"><el-tag v-for="tag in selected.tags" :key="tag" size="small" type="info">{{ tag }}</el-tag></div></div><div class="detail-balance"><small>可用余额</small><strong class="money">{{ money(selected.balanceCents) }}</strong></div></div>
-        <div class="detail-actions"><el-button type="primary" @click="router.push({ path: '/quotes', query: { customerId: selected.id } })">为此客户开单</el-button><el-button v-if="can('recharge')" @click="openRecharge(selected)">登记充值</el-button><el-button v-if="isAdmin" type="danger" plain :disabled="selected.balanceCents <= 0" @click="openWalletRefund(selected)">退还账户本金</el-button><el-button @click="openEditor(selected)">编辑资料</el-button></div>
+        <div class="detail-actions"><el-button v-if="selected.active && !selected.deletedAt && !selected.archivedAt && canHandleCustomer(selected)" type="primary" @click="router.push({ path: '/quotes', query: { customerId: selected.id } })">为此客户开单</el-button><el-button v-if="can('recharge') && selected.active && !selected.deletedAt && !selected.archivedAt && canHandleCustomer(selected)" @click="openRecharge(selected)">登记充值</el-button><el-button v-if="canHandleCustomer(selected)" type="danger" plain :disabled="selected.balanceCents <= 0" @click="openWalletRefund(selected)">退还账户本金</el-button><el-button v-if="canHandleCustomer(selected) && !selected.deletedAt" @click="openEditor(selected)">编辑资料</el-button><template v-if="canHandleCustomer(selected)"><el-button v-if="!selected.deletedAt && !selected.archivedAt" @click="recordAction('customerArchive', selected)">停用 / 归档</el-button><el-button v-if="!selected.deletedAt" type="danger" plain @click="recordAction('customerDelete', selected)">删除误建资料</el-button><el-button v-if="selected.deletedAt || selected.archivedAt || !selected.active" @click="recordAction('customerRestore', selected)">恢复资料</el-button></template></div>
         <el-tabs v-model="detailTab">
-          <el-tab-pane label="基本资料" name="overview"><el-descriptions :column="2" border><el-descriptions-item label="客户来源">{{ selected.source || '未登记' }}</el-descriptions-item><el-descriptions-item label="跟进客服">{{ staffName(selected.ownerId) }}</el-descriptions-item><el-descriptions-item label="会员权益">{{ benefitName(selected) }}</el-descriptions-item><el-descriptions-item label="档案状态">{{ selected.active ? '正常' : '停用' }}</el-descriptions-item><el-descriptions-item label="创建时间">{{ dateTime(selected.createdAt) }}</el-descriptions-item><el-descriptions-item label="最近更新">{{ dateTime(selected.updatedAt) }}</el-descriptions-item><el-descriptions-item label="内部备注" :span="2">{{ selected.notes || '暂无备注' }}</el-descriptions-item></el-descriptions><div class="detail-summary"><div><strong>{{ selectedOrders.length }}</strong><span>历史订单</span></div><div><strong>{{ money(selectedOrders.filter(o => o.payment).reduce((s, o) => s + o.totalCents, 0)) }}</strong><span>已结清订单金额</span></div><div><strong>{{ selectedRecharges.length }}</strong><span>充值登记</span></div></div></el-tab-pane>
+          <el-tab-pane label="基本资料" name="overview"><el-descriptions :column="2" border><el-descriptions-item label="客户来源">{{ selected.source || '未登记' }}</el-descriptions-item><el-descriptions-item label="跟进客服">{{ staffName(selected.ownerId) }}</el-descriptions-item><el-descriptions-item label="会员权益">{{ benefitName(selected) }}</el-descriptions-item><el-descriptions-item label="档案状态">{{ selected.deletedAt ? '回收站' : selected.archivedAt ? '已归档' : selected.active ? '正常' : '停用' }}</el-descriptions-item><el-descriptions-item label="创建时间">{{ dateTime(selected.createdAt) }}</el-descriptions-item><el-descriptions-item label="最近更新">{{ dateTime(selected.updatedAt) }}</el-descriptions-item><el-descriptions-item label="内部备注" :span="2">{{ selected.notes || '暂无备注' }}</el-descriptions-item></el-descriptions><div class="detail-summary"><div><strong>{{ selectedOrders.length }}</strong><span>历史订单</span></div><div><strong>{{ money(selectedOrders.filter(o => o.payment).reduce((s, o) => s + o.totalCents, 0)) }}</strong><span>已结清订单金额</span></div><div><strong>{{ selectedRecharges.length }}</strong><span>充值登记</span></div></div></el-tab-pane>
           <el-tab-pane label="会员与权益" name="membership"><el-alert title="会员暂不设有效期；消费余额减少不降级。白银、黄金沿用已选权益，升级需单次充值达到对应套餐金额。" type="info" :closable="false" show-icon class="form-alert" /><el-descriptions :column="2" border><el-descriptions-item label="当前等级"><MemberBadge :member="selected.member" /></el-descriptions-item><el-descriptions-item label="已选权益">{{ benefitName(selected) }}</el-descriptions-item><el-descriptions-item label="微信名额使用">已使用 {{ selected.wechatUsed }} 位<span v-if="wechatLimit"> / 总计 {{ wechatLimit }} 位</span></el-descriptions-item><el-descriptions-item label="闲聊群">{{ selected.groupInvited ? '已登记入群' : '未登记' }}</el-descriptions-item></el-descriptions>
             <el-form v-if="isAdmin" :model="memberForm" label-position="top" class="membership-editor"><h3 class="section-title">管理员权益登记</h3><p class="muted">用于历史资料核实、权益兑现与更正；正常开通或升级请通过充值登记。</p><div class="form-grid"><el-form-item label="会员等级"><el-select v-model="memberForm.member"><el-option v-for="m in memberships" :key="m" :label="m" :value="m"><MemberBadge :member="m" /></el-option></el-select></el-form-item><el-form-item label="权益类型"><el-select v-model="memberForm.benefit" :disabled="memberBenefitLocked || (memberForm.member !== '普通客户' && !['白银', '黄金'].includes(memberForm.member))"><el-option label="无会员权益" value="none" /><el-option label="会员折扣" value="discount" /><el-option label="加微信权益" value="wechat" /></el-select></el-form-item><el-form-item label="已使用微信名额"><el-input-number v-model="memberForm.wechatUsed" :min="0" :max="100" :precision="0" /></el-form-item><el-form-item label="闲聊群邀请"><el-switch v-model="memberForm.groupInvited" active-text="已登记入群" /></el-form-item></div><el-form-item label="处理原因" required><el-input v-model="memberForm.reason" type="textarea" :rows="2" maxlength="500" placeholder="说明权益兑现、资格核实或更正原因" /></el-form-item><el-button type="primary" :loading="busy" @click="saveMembership">保存并记录审计</el-button></el-form>
           </el-tab-pane>
-          <el-tab-pane label="充值与消费" name="ledger"><el-table :data="selectedLedger" empty-text="尚无余额变动"><el-table-column label="时间" min-width="165"><template #default="{ row }">{{ dateTime(row.createdAt) }}</template></el-table-column><el-table-column label="类型" min-width="110"><template #default="{ row }">{{ ledgerLabel(row.type) }}</template></el-table-column><el-table-column label="变动金额" min-width="120" align="right"><template #default="{ row }"><span :class="row.amountCents > 0 ? 'positive' : ''">{{ row.amountCents > 0 ? '+' : '' }}{{ money(row.amountCents) }}</span></template></el-table-column><el-table-column label="变动后余额" min-width="130" align="right"><template #default="{ row }">{{ money(row.balanceAfterCents) }}</template></el-table-column><el-table-column prop="actorName" label="经办人" min-width="100" /><el-table-column prop="note" label="备注" min-width="190" show-overflow-tooltip /></el-table><h3 class="section-title ledger-heading">充值登记</h3><el-table :data="selectedRecharges" empty-text="尚无充值登记"><el-table-column label="时间" min-width="165"><template #default="{ row }">{{ dateTime(row.createdAt) }}</template></el-table-column><el-table-column label="金额" min-width="115" align="right"><template #default="{ row }">{{ money(row.amountCents) }}</template></el-table-column><el-table-column label="用途" min-width="100"><template #default="{ row }">{{ rechargeLabel(row.kind) }}</template></el-table-column><el-table-column prop="reference" label="到账参考" min-width="160" show-overflow-tooltip /><el-table-column label="状态" min-width="90"><template #default="{ row }">{{ row.reversed ? '已冲回' : '已入账' }}</template></el-table-column><el-table-column v-if="isAdmin" label="处理" min-width="105"><template #default="{ row }"><el-button v-if="!row.reversed" link type="danger" @click="reverseRecharge(row)">撤销登记</el-button></template></el-table-column></el-table></el-tab-pane>
+          <el-tab-pane label="充值与消费" name="ledger"><el-table :data="selectedLedger" empty-text="尚无余额变动"><el-table-column label="时间" min-width="165"><template #default="{ row }">{{ dateTime(row.createdAt) }}</template></el-table-column><el-table-column label="类型" min-width="110"><template #default="{ row }">{{ ledgerLabel(row.type) }}</template></el-table-column><el-table-column label="变动金额" min-width="120" align="right"><template #default="{ row }"><span :class="row.amountCents > 0 ? 'positive' : ''">{{ row.amountCents > 0 ? '+' : '' }}{{ money(row.amountCents) }}</span></template></el-table-column><el-table-column label="变动后余额" min-width="130" align="right"><template #default="{ row }">{{ money(row.balanceAfterCents) }}</template></el-table-column><el-table-column prop="actorName" label="经办人" min-width="100" /><el-table-column prop="note" label="备注" min-width="190" show-overflow-tooltip /></el-table><h3 class="section-title ledger-heading">充值登记</h3><el-table :data="selectedRecharges" empty-text="尚无充值登记"><el-table-column label="时间" min-width="165"><template #default="{ row }">{{ dateTime(row.createdAt) }}</template></el-table-column><el-table-column label="金额" min-width="115" align="right"><template #default="{ row }">{{ money(row.amountCents) }}</template></el-table-column><el-table-column label="用途" min-width="100"><template #default="{ row }">{{ rechargeLabel(row.kind) }}</template></el-table-column><el-table-column prop="reference" label="到账参考" min-width="160" show-overflow-tooltip /><el-table-column label="状态" min-width="90"><template #default="{ row }">{{ row.reversed ? '已冲回' : '已入账' }}</template></el-table-column><el-table-column label="处理" min-width="105"><template #default="{ row }"><el-button v-if="!row.reversed && (isAdmin || state.customers.find(c=>c.id===row.customerId)?.ownerId===state.user.id)" link type="danger" @click="reverseRecharge(row)">更正 / 申请更正</el-button></template></el-table-column></el-table></el-tab-pane>
           <el-tab-pane label="历史订单" name="orders"><el-table :data="selectedOrders" empty-text="此客户尚未下单"><el-table-column label="订单编号" min-width="170"><template #default="{ row }"><el-button link type="primary" @click="router.push({ path: '/orders', query: { orderId: row.id } })">{{ row.code }}</el-button></template></el-table-column><el-table-column label="服务内容" min-width="190"><template #default="{ row }">{{ row.items.map((i: any) => `${i.mode}${i.tier} ${i.hours}h`).join(' / ') }}</template></el-table-column><el-table-column label="金额" min-width="110" align="right"><template #default="{ row }">{{ money(row.totalCents) }}</template></el-table-column><el-table-column label="状态" min-width="110"><template #default="{ row }"><el-tag :type="orderTone(row)" size="small">{{ orderLabel(row) }}</el-tag></template></el-table-column><el-table-column label="创建时间" min-width="160"><template #default="{ row }">{{ dateTime(row.createdAt) }}</template></el-table-column></el-table></el-tab-pane>
         </el-tabs>
       </template>
@@ -306,21 +283,7 @@ async function download(type: string, format: 'xlsx' | 'csv' = 'xlsx') {
       </template>
       <template #footer><el-button :disabled="busy" @click="rechargeOpen = false">取消</el-button><el-button type="primary" :loading="busy" @click="submitRecharge">已核实到账，确认入账</el-button></template>
     </el-dialog>
-    <el-dialog v-model="walletRefundOpen" title="登记账户本金退款" width="min(620px, 96vw)" :close-on-click-modal="!busy" :close-on-press-escape="!busy" append-to-body>
-      <template v-if="walletRefundCustomer">
-        <div class="recharge-client"><div><strong>{{ walletRefundCustomer.name }}</strong><div class="recharge-membership"><MemberBadge :member="walletRefundCustomer.member" /><span>{{ benefitName(walletRefundCustomer) }}</span></div></div><div><small>当前可退余额上限</small><strong class="money">{{ money(walletRefundCustomer.balanceCents) }}</strong></div></div>
-        <el-alert title="请先核实并在线下完成实际退款。本页面只登记已发生的本金退款，并减少客户余额。" type="warning" :closable="false" show-icon class="form-alert" />
-        <el-form :model="walletRefund" label-position="top">
-          <el-form-item label="实际退还本金（元）" required><el-input-number v-model="walletRefund.amount" :min="0.01" :max="walletRefundCustomer.balanceCents / 100" :precision="2" :controls="false" class="amount-input" /></el-form-item>
-          <div class="form-grid"><el-form-item label="实际退款渠道" required><el-select v-model="walletRefund.channel"><el-option v-for="channel in ['微信转账', '支付宝', '银行转账', '现金', '其他']" :key="channel" :label="channel" :value="channel" /></el-select></el-form-item><el-form-item label="退款参考号 / 凭证编号" required><el-input v-model="walletRefund.reference" maxlength="120" placeholder="实际退款记录的唯一参考号" /></el-form-item></div>
-          <el-form-item label="关联原充值记录（可选）"><el-select v-model="walletRefund.rechargeId" clearable placeholder="选择原始充值，方便追溯" style="width:100%"><el-option v-for="source in walletRefundSources" :key="source.id" :value="source.id" :label="`${rechargeLabel(source.kind)} · ${money(source.amountCents)} · ${source.reference || localDate(source.createdAt)}`" /></el-select></el-form-item>
-          <el-form-item label="退款原因" required><el-input v-model="walletRefund.reason" type="textarea" :rows="3" maxlength="1000" show-word-limit placeholder="记录客户诉求、本次核实和实际退款情况" /></el-form-item>
-          <el-alert title="会员等级与权益不会自动变化，负责人需根据实际情况核实并单独登记处理。误充值登记请使用“撤销登记”，不要与真实退款混用。" type="info" :closable="false" show-icon class="form-alert" />
-          <el-checkbox v-model="walletRefund.actualRefundConfirmed" class="refund-confirmation">我已核实上述款项已实际退还客户，现在登记余额变动</el-checkbox>
-        </el-form>
-      </template>
-      <template #footer><el-button :disabled="busy" @click="walletRefundOpen = false">取消</el-button><el-button type="danger" :loading="busy" :disabled="!walletRefund.actualRefundConfirmed" @click="submitWalletRefund">已实际退款，登记本金退还</el-button></template>
-    </el-dialog>
+    <WorkflowAction ref="workflow" />
   </div>
 </template>
 

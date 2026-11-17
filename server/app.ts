@@ -9,9 +9,13 @@ import ExcelJS from 'exceljs';
 import { z } from 'zod';
 import { defaultSettings, priceQuote } from '../shared/pricing.ts';
 import { canManageAdminAccounts, isAdminRole } from '../shared/roles.ts';
-import type { User, Customer, Player, Order, Assignment, Recharge, LedgerEntry, AuditEntry, Settings, Dashboard, Permission, QuoteItemInput, Membership, Bootstrap, QuoteDraft, QuoteDraftPayload, ReportsData, Role } from '../shared/types.ts';
+import { hasDirectPermission } from '../shared/workflow.ts';
+import { installWorkflow } from './workflow.ts';
+import type { User, Customer, Player, Order, Assignment, Recharge, LedgerEntry, AuditEntry, Settings, Dashboard, Permission, QuoteItemInput, Membership, Bootstrap, QuoteDraft, QuoteDraftPayload, ReportsData, Role, SettlementAdjustment } from '../shared/types.ts';
 
 const permissions = ['recharge', 'payment', 'refund', 'export', 'players'] as const;
+const accountPermissions = [...permissions, 'cancelConfirmed', 'terminateService', 'refundConsumed', 'deleteRecords', 'archiveRecords', 'reverseRecharge', 'walletRefund', 'personnelDelete', 'settlementAdjust'] as const;
+const elevatedPermissions: Permission[] = ['personnelDelete', 'settlementAdjust'];
 const memberships = ['普通客户', '白银', '黄金', '铂金', '钻石', '红卡'] as const;
 const modes = ['机密', '绝密'] as const;
 const tiers = ['娱乐陪', '技术陪', '高阶陪', '明星陪', '本月置顶明星'] as const;
@@ -101,7 +105,9 @@ export function createApp(options: AppOptions = {}) {
     const record: AuditEntry = { id: id(), actorId: actor?.id || '', actorName: actor?.name || '未登录', action, targetType, targetId, targetName, before: before as AuditEntry['before'], after: after as AuditEntry['after'], reason, result, ip: req?.ip || req?.socket.remoteAddress || 'local', createdAt: now() };
     put('audit', record);
   };
-  const has = (user: User, permission: Permission) => isAdminRole(user.role) || user.role === 'staff' && user.permissions.includes(permission);
+  const has = (user: User, permission: Permission) => hasDirectPermission(user, permission);
+  const assertOwner = (req: Request, entity: { ownerId: string }) => { const actor = (req as unknown as AuthedRequest).actor; if (actor.role === 'staff' && entity.ownerId !== actor.id) fail(403, '客服只能处理当前本人负责的客户或订单'); };
+  const assignedOwner = (req: Request, requested: string, fallback: string) => { const actor = (req as unknown as AuthedRequest).actor; if (actor.role === 'staff' && requested && requested !== actor.id) fail(403, '客户或订单交接需要管理员处理'); return owner(requested, fallback); };
   const assertAdmin = (req: Request) => { if (!isAdminRole((req as unknown as AuthedRequest).actor.role)) { audit(req, '权限拒绝', 'permission', '', '管理员权限', null, null, '', 'denied'); fail(403, '此操作需要管理员权限'); } };
   const assertAccountTarget = (req: Request, role: Role) => {
     assertAdmin(req);
@@ -138,7 +144,7 @@ export function createApp(options: AppOptions = {}) {
     put('quoteDrafts', draft);
     audit(req, '草稿生成订单', 'quoteDraft', draft.id, draft.title, before, draftSummary(draft), `关联订单：${order.code}`);
   };
-  const owner = (ownerId: string, fallback: string) => { const chosen = ownerId || fallback; const user = get<StoredUser>('users', chosen); if (!user.active) fail(400, '跟进客服账号已停用'); if (user.role === 'shareholder') fail(400, '股东账号不能作为业务跟进人'); return chosen; };
+  const owner = (ownerId: string, fallback: string) => { const chosen = ownerId || fallback; const user = get<StoredUser>('users', chosen); if (!user.active || user.deletedAt) fail(400, '跟进客服账号已停用'); if (user.role === 'shareholder') fail(400, '股东账号不能作为业务跟进人'); return chosen; };
   const claimReceipt = (channel: string, reference: string, entityId: string) => { if (!reference.trim()) fail(400, '请填写外部转账参考号或凭证编号'); if (db.prepare('SELECT entity_id FROM receipt_refs WHERE channel=? AND reference=?').get(channel.trim(), reference.trim())) fail(409, '同一转账参考号已登记，请核对充值或订单记录'); db.prepare('INSERT INTO receipt_refs VALUES(?,?,?)').run(channel.trim(), reference.trim(), entityId); };
   const claimExternalRefund = (reference: string, entityId: string) => { if (!reference.trim()) fail(400, '请填写实际外部退款参考号或凭证编号'); if (db.prepare('SELECT entity_id FROM external_refund_refs WHERE reference=?').get(reference.trim())) fail(409, '此实际退款参考号已经登记，不能重复记账'); db.prepare('INSERT INTO external_refund_refs VALUES(?,?)').run(reference.trim(), entityId); };
   const claimRefundOperation = (key: string, targetId: string) => { const operationId = `refund:${key}`; if (maybe('operations', operationId)) fail(409, '这次退款已经登记，请刷新查看原记录，不能重复提交'); put('operations', { id: operationId, targetId, createdAt: now() }); };
@@ -166,7 +172,7 @@ export function createApp(options: AppOptions = {}) {
   const validateRequestedPlayers = (items: QuoteItemInput[]) => {
     for (const item of items) if (item.requestedPlayerId) {
       const player = get<Player>('players', item.requestedPlayerId);
-      if (player.status === 'disabled') fail(400, '指定的陪玩成员已经停用');
+      if (player.status === 'disabled' || player.deletedAt || player.archivedAt) fail(400, '指定的陪玩成员已经停用');
       if (!player.capabilities.some(cap => cap.mode === item.mode && cap.tier === item.tier)) fail(400, '指定人选的服务能力与该条报价不匹配');
       if (item.female && player.gender !== '女') fail(400, '指定女陪的报价请选择女性成员');
     }
@@ -253,10 +259,27 @@ export function createApp(options: AppOptions = {}) {
         CREATE TRIGGER IF NOT EXISTS batty_protect_root_update BEFORE UPDATE ON entities
         WHEN OLD.kind='users' AND json_extract(OLD.payload, '$.role')='root' AND
           (NEW.kind IS NOT OLD.kind OR NEW.id IS NOT OLD.id OR json_extract(NEW.payload, '$.id') IS NOT json_extract(OLD.payload, '$.id') OR json_extract(NEW.payload, '$.role') IS NOT 'root' OR json_extract(NEW.payload, '$.active') IS NOT 1)
-        BEGIN SELECT RAISE(ABORT, 'root账号不可停用、降级或替换身份'); END;`);
+        BEGIN SELECT RAISE(ABORT, 'root账号不可停用、降级或替换身份'); END;
+        CREATE TRIGGER IF NOT EXISTS batty_protect_root_lifecycle BEFORE UPDATE ON entities
+        WHEN OLD.kind='users' AND json_extract(OLD.payload, '$.role')='root' AND
+          (json_extract(NEW.payload, '$.deletedAt') IS NOT NULL OR json_extract(NEW.payload, '$.archivedAt') IS NOT NULL)
+        BEGIN SELECT RAISE(ABORT, 'root账号不可归档或删除'); END;`);
     });
   }
-  try { if (options.seed !== false) { if (production) initializeProduction(); else seed(); } initializeRoot(); }
+  function initializeWorkflowHistory() {
+    tx(() => {
+      const confirmationAudit = list<AuditEntry>('audit').filter(entry => entry.action === '登记客户确认' && entry.result === 'success');
+      for (const order of list<Order>('orders')) {
+        if (order.confirmationHistoryTracked) continue;
+        const confirmed = order.customerConfirmedAt || order.payment?.createdAt || confirmationAudit.find(entry => entry.targetId === order.id)?.createdAt;
+        // Older revised quotes may have lost their confirmation timestamp. Never downgrade them to staff cancellation.
+        if (confirmed || order.quoteVersion > 1 || order.status === 'confirmed' || order.status === 'paid') order.everConfirmedAt ||= confirmed || order.createdAt;
+        order.confirmationHistoryTracked = true;
+        put('orders', order);
+      }
+    });
+  }
+  try { if (options.seed !== false) { if (production) initializeProduction(); else seed(); } initializeRoot(); initializeWorkflowHistory(); }
   catch (error) { db.close(); throw error; }
 
   app.use('/api', (req, _res, next) => {
@@ -278,7 +301,7 @@ export function createApp(options: AppOptions = {}) {
     const attempts = loginAttempts.get(key);
     if (attempts && attempts.expires > Date.now() && attempts.count >= 10) fail(429, '登录尝试过多，请15分钟后重试');
     const user = list<StoredUser>('users').find(u => u.username.toLowerCase() === body.username.toLowerCase());
-    if (!user || !user.active || !verifyPassword(body.password, user.passwordHash)) {
+    if (!user || !user.active || user.deletedAt || !verifyPassword(body.password, user.passwordHash)) {
       loginAttempts.set(key, { count: attempts && attempts.expires > Date.now() ? attempts.count + 1 : 1, expires: Date.now() + 15 * 60000 });
       audit(null, '登录失败', 'account', user?.id || '', body.username, null, null, '账号或密码不正确，或账号已停用', 'failed');
       fail(401, '账号或密码不正确，或账号已停用');
@@ -297,7 +320,7 @@ export function createApp(options: AppOptions = {}) {
       const session = db.prepare('SELECT user_id,expires_at FROM sessions WHERE hash=?').get(hash);
       if (!session || String(session.expires_at) < now()) fail(401, '登录已失效，请重新登录');
       const user = maybe<StoredUser>('users', String(session.user_id));
-      if (!user?.active) fail(401, '账号已停用，请联系管理员');
+      if (!user?.active || user.deletedAt) fail(401, '账号已停用，请联系管理员');
       (req as unknown as AuthedRequest).actor = safeUser(user); (req as unknown as AuthedRequest).sessionHash = hash; next();
     } catch (error) { next(error); }
   });
@@ -320,6 +343,8 @@ export function createApp(options: AppOptions = {}) {
     }
     next();
   });
+  const workflow = installWorkflow({ app, list, get, maybe, put, tx, audit, ledger, saveOrder, settings, claimExternalRefund,
+    invalidateSessions: (userId: string) => { db.prepare('DELETE FROM sessions WHERE user_id=?').run(userId); }, fail });
   app.get('/api/me', (req, res) => res.json((req as unknown as AuthedRequest).actor));
   app.post('/api/logout', (req, res) => { tx(() => { db.prepare('DELETE FROM sessions WHERE hash=?').run((req as unknown as AuthedRequest).sessionHash); audit(req, '退出登录', 'account', (req as unknown as AuthedRequest).actor.id, (req as unknown as AuthedRequest).actor.name); }); res.clearCookie(sessionCookieName, cookieOptions); res.json({ ok: true }); });
   app.post('/api/password', (req, res) => {
@@ -387,12 +412,12 @@ export function createApp(options: AppOptions = {}) {
     const externalOrderCents = paid.reduce((s, o) => s + o.payment!.externalCents, 0);
     const completedOrder = (o: Order) => o.status !== 'cancelled' && (o.kind === 'supplement' || o.items.length > 0 && o.items.every(item => o.assignments.some(a => a.itemId === item.id && a.status === 'completed')));
     return { customers: customers.filter(c => c.active).length, players: players.filter(p => p.status !== 'disabled').length, pendingPayment: orders.filter(o => !o.payment && o.status !== 'cancelled').length,
-      pendingDispatch: paid.filter(o => o.status !== 'cancelled' && !fullyRefunded(o) && o.items.some(item => !o.assignments.some(a => a.itemId === item.id && ['assigned', 'serving', 'completed'].includes(a.status)))).length,
+      pendingDispatch: paid.filter(o => o.status !== 'cancelled' && !fullyRefunded(o) && o.items.some(item => !o.terminatedItemIds?.includes(item.id) && !o.assignments.some(a => a.itemId === item.id && ['assigned', 'serving', 'completed'].includes(a.status)))).length,
       serving: paid.filter(o => o.status !== 'cancelled' && o.assignments.some(a => a.status === 'serving')).length, completed: paid.filter(completedOrder).length,
       orderTotalCents: paid.reduce((s, o) => s + o.totalCents, 0) - orderRefundCents, rechargeCents, externalOrderCents,
       walletConsumedCents: paid.reduce((s, o) => s + o.payment!.walletCents - o.refunds.reduce((s2, r) => s2 + r.walletCents, 0), 0), refundCents, externalRefundCents,
       cashReceivedCents: rechargeCents + externalOrderCents - externalRefundCents, walletLiabilityCents: customers.reduce((s, c) => s + c.balanceCents, 0),
-      earningsCents: paid.reduce((s, o) => s + o.assignments.reduce((s2, a) => s2 + a.earningCents, 0), 0),
+      earningsCents: paid.reduce((s, o) => s + o.assignments.reduce((s2, a) => s2 + a.earningCents, 0), 0) + list<SettlementAdjustment>('settlementAdjustments').reduce((sum, adjustment) => sum + adjustment.amountCents, 0),
       daily: Array.from({ length: 7 }, (_, i) => { const date = dateKey(new Date(Date.now() - (6 - i) * 86400000)); const day = paid.filter(o => dateKey(new Date(o.payment!.createdAt)) === date); return { date, amountCents: day.reduce((s, o) => s + o.totalCents, 0), count: day.length }; }) };
   }
   app.get('/api/bootstrap', (req, res) => {
@@ -407,7 +432,9 @@ export function createApp(options: AppOptions = {}) {
     const totals = dashboard(orders, customers, players, recharges);
     const safeOrders = isAdminRole(actor.role) ? orders : orders.map(o => ({ ...o, assignments: o.assignments.map(a => ({ ...a, earningCents: 0, settled: false })) }));
     if (!isAdminRole(actor.role)) totals.earningsCents = 0;
-    const payload: Bootstrap = { demoMode: !production, user: actor, customers, players, orders: safeOrders, recharges, ledger: list<LedgerEntry>('ledger'), audit: isAdminRole(actor.role) ? list<AuditEntry>('audit').slice(0, 2000) : list<AuditEntry>('audit').filter(a => !['account', 'settings', 'permission', 'export', 'system'].includes(a.targetType) && (a.targetType !== 'quoteDraft' || a.actorId === actor.id)).map(a => ({ ...a, ip: '' })).slice(0, 1000), staff: list<StoredUser>('users').filter(u => u.active && u.role !== 'shareholder').map(u => ({ id: u.id, name: u.name })), accounts: isAdminRole(actor.role) ? list<StoredUser>('users').map(safeUser) : [], settings: settings(), dashboard: totals };
+    const visibleRequests = workflow.requestsFor(actor);
+    const visibleRequestIds = new Set(visibleRequests.map(request => request.id));
+    const payload: Bootstrap = { demoMode: !production, user: actor, customers, players, orders: safeOrders, recharges, ledger: list<LedgerEntry>('ledger'), audit: isAdminRole(actor.role) ? list<AuditEntry>('audit').slice(0, 2000) : list<AuditEntry>('audit').filter(a => !['account', 'settings', 'permission', 'export', 'system'].includes(a.targetType) && (a.targetType !== 'quoteDraft' || a.actorId === actor.id) && (a.targetType !== 'workflow' || visibleRequestIds.has(a.targetId))).map(a => ({ ...a, ip: '' })).slice(0, 1000), staff: list<StoredUser>('users').filter(u => !u.deletedAt && u.role !== 'shareholder').map(u => ({ id: u.id, name: u.name, active: u.active })), accounts: isAdminRole(actor.role) ? list<StoredUser>('users').map(safeUser) : [], settings: settings(), dashboard: totals, workflowRequests: visibleRequests, settlementAdjustments: isAdminRole(actor.role) ? list<SettlementAdjustment>('settlementAdjustments') : [] };
     res.json(payload);
   });
 
@@ -424,23 +451,24 @@ export function createApp(options: AppOptions = {}) {
       })),
       recharges: list<Recharge>('recharges').map(recharge => ({ id: recharge.id, customerName: recharge.customerName, amountCents: recharge.amountCents, kind: recharge.kind, member: recharge.member, channel: recharge.channel, reference: recharge.reference, actorName: recharge.actorName, createdAt: recharge.createdAt, reversed: recharge.reversed })),
       ledger: list<LedgerEntry>('ledger').map(entry => ({ id: entry.id, customerName: entry.customerName, type: entry.type, amountCents: entry.amountCents, balanceAfterCents: entry.balanceAfterCents, actorName: entry.actorName, createdAt: entry.createdAt })),
-      walletLiabilityCents: list<Customer>('customers').reduce((sum, customer) => sum + customer.balanceCents, 0)
+      walletLiabilityCents: list<Customer>('customers').reduce((sum, customer) => sum + customer.balanceCents, 0),
+      settlementAdjustments: financialDetails ? list<SettlementAdjustment>('settlementAdjustments') : []
     };
     res.json(payload);
   });
 
   app.post('/api/customers', (req, res) => {
     const body = customerSchema.parse(req.body); const actor = (req as unknown as AuthedRequest).actor;
-    const created = tx(() => { const customer: Customer = { ...body, id: id(), code: number('C'), ownerId: owner(body.ownerId, actor.id), balanceCents: 0, member: '普通客户', benefit: 'none', wechatUsed: 0, groupInvited: false, createdBy: actor.id, createdAt: now(), updatedAt: now(), active: true, version: 1 }; put('customers', customer); audit(req, '新建客户', 'customer', customer.id, customer.name, null, { code: customer.code, name: customer.name, contactType: customer.contactType, contact: customer.contact }); return customer; });
+    const created = tx(() => { const customer: Customer = { ...body, id: id(), code: number('C'), ownerId: assignedOwner(req, body.ownerId, actor.id), balanceCents: 0, member: '普通客户', benefit: 'none', wechatUsed: 0, groupInvited: false, createdBy: actor.id, createdAt: now(), updatedAt: now(), active: true, version: 1 }; put('customers', customer); audit(req, '新建客户', 'customer', customer.id, customer.name, null, { code: customer.code, name: customer.name, contactType: customer.contactType, contact: customer.contact }); return customer; });
     res.status(201).json(created);
   });
   app.put('/api/customers/:id', (req, res) => {
     const body = req.body;
     const saved = tx(() => {
-      const customer = get<Customer>('customers', String(req.params.id)); checkVersion(customer, body.version); const before = clone(customer);
+      const customer = get<Customer>('customers', String(req.params.id)); assertOwner(req, customer); if (customer.deletedAt || customer.archivedAt) fail(409, '请先从回收站或归档中恢复客户'); checkVersion(customer, body.version); const before = clone(customer);
       const basic = customerSchema.partial().parse(body); Object.assign(customer, basic);
-      if (basic.ownerId !== undefined) customer.ownerId = owner(basic.ownerId, customer.createdBy);
-      if (body.active !== undefined) customer.active = z.boolean().parse(body.active);
+      if (basic.ownerId !== undefined) customer.ownerId = assignedOwner(req, basic.ownerId, before.ownerId);
+      if (body.active !== undefined && body.active !== before.active) { assertPermission(req, 'archiveRecords'); customer.active = z.boolean().parse(body.active); }
       const memberFields = ['member', 'benefit', 'wechatUsed', 'groupInvited'];
       const memberChanged = memberFields.some(key => body[key] !== undefined && body[key] !== (before as any)[key]);
       if (memberChanged) {
@@ -464,13 +492,13 @@ export function createApp(options: AppOptions = {}) {
     }); res.json(saved);
   });
   app.post('/api/players', (req, res) => { assertPermission(req, 'players'); const body = playerSchema.parse(req.body); const saved = tx(() => { const player: Player = { ...body, id: id(), code: number('P'), createdAt: now(), updatedAt: now(), version: 1 }; put('players', player); audit(req, '新增陪玩成员', 'player', player.id, player.name, null, { name: player.name, status: player.status, capabilities: player.capabilities }); return player; }); res.status(201).json(saved); });
-  app.put('/api/players/:id', (req, res) => { assertPermission(req, 'players'); const saved = tx(() => { const player = get<Player>('players', String(req.params.id)); checkVersion(player, req.body.version); const before = clone(player); Object.assign(player, playerSchema.partial().parse(req.body)); player.version++; player.updatedAt = now(); put('players', player); const changedBefore: Record<string, unknown> = {}; const changedAfter: Record<string, unknown> = {}; for (const key of ['name', 'contactType', 'contact', 'gender', 'status', 'capabilities', 'notes'] as const) if (JSON.stringify(before[key]) !== JSON.stringify(player[key])) { changedBefore[key] = before[key]; changedAfter[key] = player[key]; } audit(req, '修改陪玩成员', 'player', player.id, player.name, changedBefore, changedAfter, req.body.reason || ''); return player; }); res.json(saved); });
+  app.put('/api/players/:id', (req, res) => { assertPermission(req, 'players'); const saved = tx(() => { const player = get<Player>('players', String(req.params.id)); if (player.deletedAt || player.archivedAt) fail(409, '请先从回收站或归档中恢复成员'); checkVersion(player, req.body.version); const before = clone(player); const changes = playerSchema.partial().parse(req.body); if (changes.status && changes.status !== player.status && (changes.status === 'disabled' || player.status === 'disabled')) assertPermission(req, 'archiveRecords'); Object.assign(player, changes); player.version++; player.updatedAt = now(); put('players', player); const changedBefore: Record<string, unknown> = {}; const changedAfter: Record<string, unknown> = {}; for (const key of ['name', 'contactType', 'contact', 'gender', 'status', 'capabilities', 'notes'] as const) if (JSON.stringify(before[key]) !== JSON.stringify(player[key])) { changedBefore[key] = before[key]; changedAfter[key] = player[key]; } audit(req, '修改陪玩成员', 'player', player.id, player.name, changedBefore, changedAfter, req.body.reason || ''); return player; }); res.json(saved); });
 
   app.post('/api/recharges', (req, res) => {
     assertPermission(req, 'recharge');
     const body = z.object({ customerId: requiredText(80), amountCents: positiveMoney, kind: z.enum(['initial', 'renewal', 'upgrade', 'opening']), member: memberSchema.default('普通客户'), benefit: benefitSchema.default('none'), channel: requiredText(30), reference: text(120).default(''), note: text(1000).default(''), exceptionReason: text(1000).optional() }).parse(req.body);
     const created = tx(() => {
-      let customer = get<Customer>('customers', body.customerId); if (!customer.active) fail(400, '客户档案已停用'); const before = clone(customer); const actor = (req as unknown as AuthedRequest).actor;
+      let customer = get<Customer>('customers', body.customerId); assertOwner(req, customer); if (!customer.active || customer.deletedAt || customer.archivedAt) fail(400, '客户档案已停用'); const before = clone(customer); const actor = (req as unknown as AuthedRequest).actor;
       const cfg = settings(); let nextMember = customer.member; let nextBenefit = customer.benefit;
       if (body.kind === 'opening') { assertAdmin(req); if (!body.note.trim()) fail(400, '期初余额必须注明来源'); }
       else if (body.kind === 'initial' && body.member !== '普通客户') {
@@ -496,12 +524,27 @@ export function createApp(options: AppOptions = {}) {
       audit(req, body.kind === 'upgrade' ? '充值并升级会员' : body.kind === 'opening' ? '录入期初余额' : '确认充值到账', 'recharge', recharge.id, `${customer.name} · ￥${(body.amountCents / 100).toFixed(2)}`, { balanceCents: before.balanceCents, member: before.member, benefit: before.benefit, wechatEntitlement: before.benefit === 'wechat' ? { total: cfg.members[before.member]?.wechatLimit || 0, used: before.wechatUsed, remaining: Math.max(0, (cfg.members[before.member]?.wechatLimit || 0) - before.wechatUsed) } : null }, { balanceCents: customer.balanceCents, member: customer.member, benefit: customer.benefit, amountCents: body.amountCents, channel: body.channel, reference: body.reference, legacyWechatRemaining: before.benefit === 'wechat' && customer.benefit !== 'wechat' ? Math.max(0, (cfg.members[before.member]?.wechatLimit || 0) - before.wechatUsed) : 0 }, recharge.note); return recharge;
     }); res.status(201).json(created);
   });
-  app.post('/api/recharges/:id/reverse', (req, res) => { assertAdmin(req); const reason = requireReason(req.body.reason); const result = tx(() => { const recharge = get<Recharge>('recharges', String(req.params.id)); if (recharge.reversed) fail(409, '此充值已更正，不能重复操作'); const customer = get<Customer>('customers', recharge.customerId); const updated = ledger(customer, -recharge.amountCents, '充值更正', (req as unknown as AuthedRequest).actor, `${reason}；会员资格需管理员核实`, '', recharge.id); recharge.reversed = true; put('recharges', recharge); audit(req, '更正充值记录', 'recharge', recharge.id, recharge.customerName, { balanceCents: customer.balanceCents, amountCents: recharge.amountCents }, { balanceCents: updated.balanceCents, reversed: true, membershipReviewRequired: true }, reason); return recharge; }); res.json(result); });
+  app.post('/api/recharges/:id/reverse', (req, res) => {
+    const reason = requireReason(req.body.reason);
+    const result = tx(() => {
+      const recharge = get<Recharge>('recharges', String(req.params.id));
+      const customer = get<Customer>('customers', recharge.customerId);
+      const plan = { action: 'rechargeReverse' as const, targetId: recharge.id, reason, memberReview: req.body.memberReview || (customer.member === '普通客户' ? { confirmed: true as const } : undefined) };
+      workflow.assertDirect(req, plan);
+      const balanceBefore = customer.balanceCents;
+      workflow.applyMemberReview(req, customer, plan);
+      const updated = ledger(customer, -recharge.amountCents, '充值更正', (req as unknown as AuthedRequest).actor, `${reason}；已核定会员权益`, '', recharge.id);
+      recharge.reversed = true; put('recharges', recharge);
+      audit(req, '更正充值记录', 'recharge', recharge.id, recharge.customerName, { balanceCents: balanceBefore, amountCents: recharge.amountCents }, { balanceCents: updated.balanceCents, reversed: true, membershipReviewRequired: false, memberReviewConfirmed: true }, reason);
+      return recharge;
+    }); res.json(result);
+  });
   app.post('/api/customers/:id/wallet-refund', (req, res) => {
-    assertAdmin(req);
     const body = z.object({ amountCents: positiveMoney, reference: requiredText(120), channel: requiredText(30), reason: requiredText(1000), idempotencyKey: requiredText(120), rechargeId: text(80).optional() }).parse(req.body);
     const result = tx(() => {
       const customer = get<Customer>('customers', String(req.params.id));
+      const plan = { action: 'walletRefund' as const, targetId: customer.id, reason: body.reason, externalCents: body.amountCents, rechargeId: body.rechargeId, memberReview: req.body.memberReview || (customer.member === '普通客户' ? { confirmed: true as const } : undefined) };
+      workflow.assertDirect(req, plan);
       const sources = list<Recharge>('recharges').filter(r => r.customerId === customer.id && !r.reversed);
       const pastRefunds = list<WalletRefund>('walletRefunds').filter(r => r.customerId === customer.id);
       const refundablePrincipal = sources.reduce((s, r) => s + r.amountCents, 0) - pastRefunds.reduce((s, r) => s + r.amountCents, 0);
@@ -509,9 +552,10 @@ export function createApp(options: AppOptions = {}) {
       if (body.rechargeId) { const source = sources.find(r => r.id === body.rechargeId); if (!source) fail(400, '选择的原充值单无效或不属于该客户'); const sourceRemaining = source.amountCents - pastRefunds.filter(r => r.rechargeId === source.id).reduce((s, r) => s + r.amountCents, 0); if (body.amountCents > sourceRemaining) fail(400, '退款金额超过所选充值单的剩余本金'); }
       claimRefundOperation(body.idempotencyKey, customer.id);
       const actor = (req as unknown as AuthedRequest).actor;
-      const refund: WalletRefund = { id: id(), customerId: customer.id, customerName: customer.name, ...body, actorId: actor.id, actorName: actor.name, createdAt: now(), memberReviewRequired: customer.member !== '普通客户' };
+      const refund: WalletRefund = { id: id(), customerId: customer.id, customerName: customer.name, ...body, actorId: actor.id, actorName: actor.name, createdAt: now(), memberReviewRequired: false };
+      workflow.applyMemberReview(req, customer, plan);
       claimExternalRefund(body.reference, refund.id);
-      const updated = ledger(customer, -body.amountCents, '充值本金退款', actor, `${body.reason}；实际外部退款：${body.channel}/${body.reference}；会员资格由管理员核实`, '', refund.id);
+      const updated = ledger(customer, -body.amountCents, '充值本金退款', actor, `${body.reason}；实际外部退款：${body.channel}/${body.reference}；已核定会员权益`, '', refund.id);
       put('walletRefunds', refund);
       audit(req, '登记充值本金退款', 'customer', customer.id, customer.name, { balanceCents: customer.balanceCents, member: customer.member }, { balanceCents: updated.balanceCents, member: updated.member, amountCents: body.amountCents, channel: body.channel, reference: body.reference, refundId: refund.id, memberReviewRequired: refund.memberReviewRequired }, body.reason);
       return refund;
@@ -524,11 +568,11 @@ export function createApp(options: AppOptions = {}) {
     const created = tx(() => {
       const source = draftSource(req, body);
       if (source?.payload.editId) fail(409, '此草稿用于修订已有订单，请返回原订单继续处理');
-      const customer = get<Customer>('customers', body.customerId); if (!customer.active) fail(400, '客户档案已停用'); validateRequestedPlayers(body.items); const quote = price(body.items, customer);
+      const customer = get<Customer>('customers', body.customerId); assertOwner(req, customer); if (!customer.active || customer.deletedAt || customer.archivedAt) fail(400, '客户档案已停用'); validateRequestedPlayers(body.items); const quote = price(body.items, customer);
       if (body.adjustmentCents) { assertAdmin(req); requireReason(body.adjustmentReason); }
       if (quote.totalCents + body.adjustmentCents < 0) fail(400, '调整后的订单金额不能小于零');
       if (body.parentOrderId && get<Order>('orders', body.parentOrderId).customerId !== customer.id) fail(400, '续单必须关联原订单的同一位客户');
-      const order: Order = { ...quote, id: id(), code: number('BT'), customerId: customer.id, customerName: customer.name, member: customer.member, benefit: customer.benefit, totalCents: quote.totalCents + body.adjustmentCents, adjustmentCents: body.adjustmentCents, adjustmentReason: body.adjustmentReason, quoteVersion: 1, version: 1, notes: body.notes, promise: body.promise, status: 'draft', refunds: [], assignments: [], createdBy: actor.id, createdByName: actor.name, ownerId: owner(body.ownerId, actor.id), createdAt: now(), updatedAt: now(), parentOrderId: body.parentOrderId || undefined };
+      const order: Order = { ...quote, id: id(), code: number('BT'), customerId: customer.id, customerName: customer.name, member: customer.member, benefit: customer.benefit, totalCents: quote.totalCents + body.adjustmentCents, adjustmentCents: body.adjustmentCents, adjustmentReason: body.adjustmentReason, quoteVersion: 1, version: 1, notes: body.notes, promise: body.promise, status: 'draft', confirmationHistoryTracked: true, refunds: [], assignments: [], createdBy: actor.id, createdByName: actor.name, ownerId: assignedOwner(req, body.ownerId, actor.id), createdAt: now(), updatedAt: now(), parentOrderId: body.parentOrderId || undefined };
       if (body.adjustmentCents) recordAdjustment(req, order, { adjustmentCents: 0, totalCents: quote.totalCents }, body.adjustmentCents, body.adjustmentReason);
       put('orders', order); finishDraft(req, source, order); audit(req, '创建订单报价', 'order', order.id, order.code, null, { customerId: customer.id, customerName: customer.name, items: order.items, totalCents: order.totalCents, quoteVersion: order.quoteVersion }, body.adjustmentReason || body.notes); return order;
     }); res.status(201).json(created);
@@ -536,18 +580,18 @@ export function createApp(options: AppOptions = {}) {
   app.put('/api/orders/:id', (req, res) => {
     const body = orderSchema.parse(req.body);
     const result = tx(() => {
-      const order = get<Order>('orders', String(req.params.id)); checkVersion(order, req.body.version);
+      const order = get<Order>('orders', String(req.params.id)); assertOwner(req, order); checkVersion(order, req.body.version);
       if (order.kind === 'supplement') fail(409, '补款单没有服务明细，请使用特殊情况增减款调整金额');
       const source = draftSource(req, body);
       if (source?.payload.editId && source.payload.editId !== order.id) fail(409, '此草稿关联其他订单，请返回原订单继续处理');
       if (order.payment || order.status === 'cancelled') fail(409, '已结清或取消的订单不能改价，请续单或登记退款');
       const before = clone(order), adjustmentChanged = body.adjustmentCents !== order.adjustmentCents || body.adjustmentReason !== order.adjustmentReason;
-      const customer = get<Customer>('customers', body.customerId); if (!customer.active) fail(400, '客户档案已停用');
+      const customer = get<Customer>('customers', body.customerId); assertOwner(req, customer); if (!customer.active || customer.deletedAt || customer.archivedAt) fail(400, '客户档案已停用');
       validateRequestedPlayers(body.items); const quote = price(body.items, customer);
       if (body.adjustmentCents || adjustmentChanged) { assertAdmin(req); requireReason(body.adjustmentReason); }
       if (quote.totalCents + body.adjustmentCents < 0) fail(400, '订单金额不能小于零');
       if (adjustmentChanged) preserveLegacyAdjustment(order);
-      Object.assign(order, quote, { customerId: customer.id, customerName: customer.name, member: customer.member, benefit: customer.benefit, totalCents: quote.totalCents + body.adjustmentCents, adjustmentCents: body.adjustmentCents, adjustmentReason: body.adjustmentReason, notes: body.notes, promise: body.promise, ownerId: owner(body.ownerId, order.ownerId), status: 'draft', quoteVersion: order.quoteVersion + 1 });
+      Object.assign(order, quote, { customerId: customer.id, customerName: customer.name, member: customer.member, benefit: customer.benefit, totalCents: quote.totalCents + body.adjustmentCents, adjustmentCents: body.adjustmentCents, adjustmentReason: body.adjustmentReason, notes: body.notes, promise: body.promise, ownerId: assignedOwner(req, body.ownerId, order.ownerId), status: 'draft', quoteVersion: order.quoteVersion + 1 });
       if (adjustmentChanged) recordAdjustment(req, order, before, order.adjustmentCents - before.adjustmentCents, body.adjustmentReason);
       delete order.customerConfirmedAt; delete order.copiedAt; saveOrder(order); finishDraft(req, source, order);
       audit(req, '修订订单报价', 'order', order.id, order.code, { totalCents: before.totalCents, adjustmentCents: before.adjustmentCents, items: before.items, quoteVersion: before.quoteVersion }, { totalCents: order.totalCents, adjustmentCents: order.adjustmentCents, items: order.items, quoteVersion: order.quoteVersion }, body.adjustmentReason || body.notes);
@@ -586,7 +630,7 @@ export function createApp(options: AppOptions = {}) {
       if (!original.payment || original.status !== 'paid' || fullyRefunded(original)) fail(409, '只有已结清且未取消、未全额退款的服务订单可以新增补款单');
       const customer = get<Customer>('customers', original.customerId); if (!customer.active) fail(400, '客户档案已停用');
       const actor = (req as unknown as AuthedRequest).actor;
-      const order: Order = { id: id(), code: number('BT'), kind: 'supplement', customerId: original.customerId, customerName: original.customerName, member: original.member, benefit: original.benefit, items: [], subtotalCents: 0, groupDiscountCents: 0, discountCents: 0, totalCents: body.amountCents, adjustmentCents: body.amountCents, adjustmentReason: body.reason, quoteVersion: 1, version: 1, notes: '', promise: body.reason, status: 'draft', refunds: [], assignments: [], createdBy: actor.id, createdByName: actor.name, ownerId: owner(original.ownerId, actor.id), createdAt: now(), updatedAt: now(), parentOrderId: original.id };
+      const order: Order = { id: id(), code: number('BT'), kind: 'supplement', customerId: original.customerId, customerName: original.customerName, member: original.member, benefit: original.benefit, items: [], subtotalCents: 0, groupDiscountCents: 0, discountCents: 0, totalCents: body.amountCents, adjustmentCents: body.amountCents, adjustmentReason: body.reason, quoteVersion: 1, version: 1, notes: '', promise: body.reason, status: 'draft', confirmationHistoryTracked: true, refunds: [], assignments: [], createdBy: actor.id, createdByName: actor.name, ownerId: owner(original.ownerId, actor.id), createdAt: now(), updatedAt: now(), parentOrderId: original.id };
       recordAdjustment(req, order, { adjustmentCents: 0, totalCents: 0 }, body.amountCents, body.reason);
       put('orders', order); saveOrder(original);
       put('operations', { id: operationId, targetId, fingerprint, orderId: order.id, createdAt: now() });
@@ -595,7 +639,7 @@ export function createApp(options: AppOptions = {}) {
       return { repeated: false, order };
     }); res.status(result.repeated ? 200 : 201).json(result.order);
   });
-  app.post('/api/orders/:id/confirm', (req, res) => { const result = tx(() => { const order = get<Order>('orders', String(req.params.id)); checkQuoteVersion(order, req.body); if (order.status === 'cancelled') fail(409, '订单已取消'); if (order.customerConfirmedAt) return order; order.customerConfirmedAt = now(); order.status = 'confirmed'; saveOrder(order); audit(req, '登记客户确认', 'order', order.id, order.code, { status: 'draft' }, { status: order.status, quoteVersion: order.quoteVersion, totalCents: order.totalCents }, text(1000).parse(req.body.note || '客服已与客户核实本次报价')); return order; }); res.json(result); });
+  app.post('/api/orders/:id/confirm', (req, res) => { const result = tx(() => { const order = get<Order>('orders', String(req.params.id)); assertOwner(req, order); checkQuoteVersion(order, req.body); if (order.status === 'cancelled') fail(409, '订单已取消'); if (order.customerConfirmedAt) return order; order.customerConfirmedAt = now(); order.everConfirmedAt ||= order.customerConfirmedAt; order.confirmationHistoryTracked = true; order.status = 'confirmed'; saveOrder(order); audit(req, '登记客户确认', 'order', order.id, order.code, { status: 'draft' }, { status: order.status, quoteVersion: order.quoteVersion, totalCents: order.totalCents }, text(1000).parse(req.body.note || '客服已与客户核实本次报价')); return order; }); res.json(result); });
   app.post('/api/orders/:id/copy', (req, res) => {
     const body = z.object({ quoteVersion: z.number().int().positive(), version: z.number().int().positive().optional(), format: z.enum(['text', 'image']).default('text'), purpose: z.enum(['copy', 'download']).default('copy') }).parse(req.body);
     const result = tx(() => {
@@ -608,9 +652,10 @@ export function createApp(options: AppOptions = {}) {
   app.post('/api/orders/:id/pay', (req, res) => {
     assertPermission(req, 'payment'); const body = z.object({ walletCents: money, externalCents: money, channel: text(30).default(''), reference: text(120).default(''), note: text(1000).default(''), quoteVersion: z.number().int().positive(), version: z.number().int().positive().optional() }).parse(req.body);
     const result = tx(() => {
-      const order = get<Order>('orders', String(req.params.id)); checkQuoteVersion(order, body); if (order.payment) fail(409, '此订单已确认结清，不能重复扣款'); if (order.status !== 'confirmed' || !order.customerConfirmedAt) fail(409, '请先登记客户对本次报价的确认');
+      const order = get<Order>('orders', String(req.params.id)); assertOwner(req, order); checkQuoteVersion(order, body); if (order.payment) fail(409, '此订单已确认结清，不能重复扣款'); if (order.status !== 'confirmed' || !order.customerConfirmedAt) fail(409, '请先登记客户对本次报价的确认');
       if (body.walletCents + body.externalCents !== order.totalCents) fail(400, '余额抵扣与外部到账合计必须等于本单应付金额');
-      const customer = get<Customer>('customers', order.customerId); if (!customer.active) fail(400, '客户档案已停用'); const balanceBeforePayment = customer.balanceCents;
+      const customer = get<Customer>('customers', order.customerId); assertOwner(req, customer); if (!customer.active || customer.deletedAt || customer.archivedAt) fail(400, '客户档案已停用'); const balanceBeforePayment = customer.balanceCents;
+      if (body.walletCents > customer.balanceCents - workflow.reservedWalletRefund(customer.id)) fail(409, '可用余额不足，部分余额已预留用于批准待执行的本金退款');
       const payment = { id: id(), ...body, actorId: (req as unknown as AuthedRequest).actor.id, actorName: (req as unknown as AuthedRequest).actor.name, createdAt: now() };
       if (body.externalCents > 0) { if (!body.channel) fail(400, '请选择外部收款渠道'); claimReceipt(body.channel, body.reference, payment.id); }
       if (body.walletCents > 0) ledger(customer, -body.walletCents, '订单消费', (req as unknown as AuthedRequest).actor, body.note || order.code, order.id, payment.id);
@@ -620,7 +665,8 @@ export function createApp(options: AppOptions = {}) {
 
   function validateAssignment(order: Order, itemId: string, playerId: string, reason = '', allowConflict = false, exceptAssignment = '') {
     const item = order.items.find(i => i.id === itemId); if (!item) fail(400, '订单服务明细不存在');
-    const player = get<Player>('players', playerId); if (player.status !== 'available') fail(400, '该陪玩当前休息或停用，请先维护接单状态');
+    const player = get<Player>('players', playerId); if (player.status !== 'available' || player.deletedAt || player.archivedAt) fail(400, '该陪玩当前休息或停用，请先维护接单状态');
+    if (order.terminatedItemIds?.includes(itemId)) fail(409, '此服务项已终止，不能再次派单，请另建关联订单');
     if (!player.capabilities.some(c => c.mode === item.mode && c.tier === item.tier)) fail(400, '该陪玩的服务能力与订单模式、档位不匹配');
     if (item.female && player.gender !== '女') fail(400, '本项指定女陪，请选择符合要求的成员');
     if (item.requestedPlayerId && item.requestedPlayerId !== playerId && !reason.trim()) fail(400, '更换客户指定人选需填写客户同意的说明');
@@ -629,11 +675,11 @@ export function createApp(options: AppOptions = {}) {
     if (conflict && (!allowConflict || !reason.trim())) fail(409, '该成员在此时段已有安排。如已与双方协调，请填写说明后确认冲突安排');
     return player;
   }
-  app.post('/api/orders/:id/assign', (req, res) => { const body = z.object({ itemId: requiredText(100), playerId: requiredText(80), reason: text(1000).default(''), allowConflict: z.boolean().default(false) }).parse(req.body); const result = tx(() => { const order = get<Order>('orders', String(req.params.id)); if (order.kind === 'supplement') fail(409, '补款单只登记费用，不产生陪玩派单'); if (order.status !== 'paid' || fullyRefunded(order)) fail(409, '只有已结清且未全额退款的订单可以派单'); if (order.assignments.some(a => a.itemId === body.itemId && ['assigned', 'serving', 'completed'].includes(a.status))) fail(409, '此项已有派单，请使用换人操作'); const player = validateAssignment(order, body.itemId, body.playerId, body.reason, body.allowConflict); const assignment: Assignment = { id: id(), itemId: body.itemId, playerId: player.id, playerName: player.name, status: 'assigned', assignedAt: now(), reason: body.reason, freeMinutes: 0, earningCents: 0, settled: false }; order.assignments.push(assignment); saveOrder(order); audit(req, '关联派单成员', 'order', order.id, order.code, null, { itemId: body.itemId, playerId: player.id, playerName: player.name, assignmentId: assignment.id }, body.reason); return order; }); res.json(result); });
+  app.post('/api/orders/:id/assign', (req, res) => { const body = z.object({ itemId: requiredText(100), playerId: requiredText(80), reason: text(1000).default(''), allowConflict: z.boolean().default(false) }).parse(req.body); const result = tx(() => { const order = get<Order>('orders', String(req.params.id)); assertOwner(req, order); if (order.kind === 'supplement') fail(409, '补款单只登记费用，不产生陪玩派单'); if (order.status !== 'paid' || fullyRefunded(order)) fail(409, '只有已结清且未全额退款的订单可以派单'); if (order.assignments.some(a => a.itemId === body.itemId && ['assigned', 'serving', 'completed'].includes(a.status))) fail(409, '此项已有派单，请使用换人操作'); const player = validateAssignment(order, body.itemId, body.playerId, body.reason, body.allowConflict); const assignment: Assignment = { id: id(), itemId: body.itemId, playerId: player.id, playerName: player.name, status: 'assigned', assignedAt: now(), reason: body.reason, freeMinutes: 0, earningCents: 0, settled: false }; order.assignments.push(assignment); saveOrder(order); audit(req, '关联派单成员', 'order', order.id, order.code, null, { itemId: body.itemId, playerId: player.id, playerName: player.name, assignmentId: assignment.id }, body.reason); return order; }); res.json(result); });
   app.post('/api/orders/:id/assignment/:assignmentId', (req, res) => {
     const body = z.object({ action: z.enum(['start', 'complete', 'replace', 'free', 'earning']), playerId: text(80).optional(), reason: text(1000).default(''), minutes: z.number().int().min(1).max(10080).optional(), earningCents: money.optional(), settled: z.boolean().optional(), allowConflict: z.boolean().default(false), idempotencyKey: requiredText(120).optional() }).parse(req.body);
     const result = tx(() => {
-      const order = get<Order>('orders', String(req.params.id));
+      const order = get<Order>('orders', String(req.params.id)); assertOwner(req, order);
       const operationId = body.action === 'free' && body.idempotencyKey ? `assignment-free:${body.idempotencyKey}` : '';
       const fingerprint = operationId ? tokenHash(JSON.stringify(body)) : '';
       if (operationId) {
@@ -648,7 +694,7 @@ export function createApp(options: AppOptions = {}) {
       if (body.action === 'start') { if (assignment.status !== 'assigned') fail(409, '只有待服务的派单可以开始'); assignment.status = 'serving'; assignment.startedAt = now(); action = '登记服务开始'; }
       if (body.action === 'complete') { if (assignment.status !== 'serving') fail(409, '只有服务中的派单可以完成'); assignment.status = 'completed'; assignment.endedAt = now(); action = '登记服务完成'; }
       if (body.action === 'free') { if (!['assigned', 'serving', 'completed'].includes(assignment.status)) fail(409, '此派单不能增加赠时'); if (!body.minutes) fail(400, '请填写赠时或补打分钟数'); requireReason(body.reason); assignment.freeMinutes += body.minutes; assignment.freeReason = [assignment.freeReason, `${body.minutes}分钟：${body.reason}`].filter(Boolean).join('；'); action = '登记免费补时或补打'; }
-      if (body.action === 'earning') { assertAdmin(req); if (body.earningCents === undefined) fail(400, '请填写成员应得金额'); assignment.earningCents = body.earningCents; assignment.settled = body.settled ?? assignment.settled; action = '登记陪玩应得金额'; }
+      if (body.action === 'earning') { assertAdmin(req); if (body.earningCents === undefined) fail(400, '请填写成员应得金额'); if (assignment.settled && (body.earningCents !== assignment.earningCents || body.settled === false)) fail(409, '已结算金额请通过资金更正处理，保留原结算和差额记录'); assignment.earningCents = body.earningCents; assignment.settled = body.settled ?? assignment.settled; action = '登记陪玩应得金额'; }
       if (body.action === 'replace') { if (!['assigned', 'serving'].includes(assignment.status)) fail(409, '只有待服务或服务中的派单可以换人'); requireReason(body.reason); if (!body.playerId || body.playerId === assignment.playerId) fail(400, '请选择另一位陪玩'); const player = validateAssignment(order, assignment.itemId, body.playerId, body.reason, body.allowConflict, assignment.id); assignment.status = 'replaced'; assignment.endedAt = now(); assignment.reason = body.reason; order.assignments.push({ id: id(), itemId: assignment.itemId, playerId: player.id, playerName: player.name, status: 'assigned', assignedAt: now(), reason: body.reason, freeMinutes: 0, earningCents: 0, settled: false }); action = '更换陪玩成员'; }
       saveOrder(order);
       if (operationId) put('operations', { id: operationId, targetId: order.id, assignmentId: assignment.id, fingerprint, createdAt: now() });
@@ -656,22 +702,26 @@ export function createApp(options: AppOptions = {}) {
     }); res.json(result);
   });
   app.post('/api/orders/:id/refund', (req, res) => {
-    assertPermission(req, 'refund'); const body = z.object({ walletCents: money, externalCents: money, reason: requiredText(1000), reference: text(120).default(''), cancelRemaining: z.boolean().default(false), idempotencyKey: requiredText(120) }).parse(req.body);
+    const body = z.object({ walletCents: money, externalCents: money, reason: requiredText(1000), reference: text(120).default(''), cancelRemaining: z.boolean().default(false), idempotencyKey: requiredText(120) }).parse(req.body);
     const result = tx(() => {
       const order = get<Order>('orders', String(req.params.id)); if (!order.payment) fail(409, '订单尚未结清，无可退款金额');
       claimRefundOperation(body.idempotencyKey, order.id);
       if (body.walletCents + body.externalCents <= 0) fail(400, '退款金额必须大于零');
-      const refunded = sumsRefund(order); if (body.walletCents > order.payment.walletCents - refunded.wallet || body.externalCents > order.payment.externalCents - refunded.external) fail(400, '退款金额超过对应付款来源的剩余可退金额');
+      const refunded = sumsRefund(order), reserved = workflow.reservedOrderRefund(order.id);
+      if (body.walletCents > order.payment.walletCents - refunded.wallet - reserved.walletCents || body.externalCents > order.payment.externalCents - refunded.external - reserved.externalCents) fail(400, '退款金额超过对应付款来源的剩余可退金额，或金额已被其他批准退款占用');
+      const remainingServices = order.kind === 'supplement' || order.items.some(item => !order.terminatedItemIds?.includes(item.id) && !order.assignments.some(a => a.itemId === item.id && a.status === 'completed'));
+      const cancelRemaining = body.cancelRemaining || remainingServices && refunded.wallet + refunded.external + body.walletCents + body.externalCents >= order.payment.walletCents + order.payment.externalCents;
+      workflow.assertDirect(req, { action: 'orderRefund', targetId: order.id, reason: body.reason, walletCents: body.walletCents, externalCents: body.externalCents, cancelRemaining });
       const unstartedCents = order.items.filter(item => !order.assignments.some(a => a.itemId === item.id && a.startedAt)).reduce((sum, item) => sum + item.totalCents, 0);
       const staffRefundLimitCents = Math.max(0, unstartedCents + Math.min(0, order.adjustmentCents) - refunded.wallet - refunded.external);
-      if (!isAdminRole((req as unknown as AuthedRequest).actor.role) && body.walletCents + body.externalCents > staffRefundLimitCents) fail(403, '退款超出未开始服务部分的可退金额，已消费服务退费需管理员处理');
+      if (!has((req as unknown as AuthedRequest).actor, 'refundConsumed') && body.walletCents + body.externalCents > staffRefundLimitCents) fail(403, '退款超出未开始服务部分的可退金额，已消费服务退费需授权或申请');
       if (body.externalCents > 0 && !body.reference) fail(400, '外部退款请填写实际退款参考号或凭证编号');
       const actor = (req as unknown as AuthedRequest).actor;
       const refund = { id: id(), walletCents: body.walletCents, externalCents: body.externalCents, reason: body.reason, reference: body.reference, actorId: actor.id, actorName: actor.name, createdAt: now() };
       if (body.externalCents > 0) claimExternalRefund(body.reference, refund.id);
       if (body.walletCents) ledger(get<Customer>('customers', order.customerId), body.walletCents, '订单退款', actor, body.reason, order.id, refund.id);
       order.refunds.push(refund);
-      if (body.cancelRemaining || fullyRefunded(order)) { order.assignments.forEach(a => { if (['assigned', 'serving'].includes(a.status)) { a.status = 'cancelled'; a.endedAt = now(); a.reason = body.reason; } }); order.status = 'cancelled'; }
+      if (cancelRemaining) { order.assignments.forEach(a => { if (['assigned', 'serving'].includes(a.status)) { a.status = 'cancelled'; a.endedAt = now(); a.reason = body.reason; } }); order.terminatedItemIds = order.items.filter(item => !order.assignments.some(a => a.itemId === item.id && a.status === 'completed')).map(item => item.id); order.status = 'cancelled'; }
       saveOrder(order); audit(req, '登记订单退款', 'order', order.id, order.code, { walletRefundedCents: refunded.wallet, externalRefundedCents: refunded.external }, { walletCents: body.walletCents, externalCents: body.externalCents, reference: body.reference, status: order.status }, body.reason); return order;
     }); res.json(result);
   });
@@ -681,27 +731,31 @@ export function createApp(options: AppOptions = {}) {
       const order = get<Order>('orders', String(req.params.id));
       if (order.status === 'cancelled') fail(409, '订单已经取消');
       if (order.payment && order.payment.walletCents + order.payment.externalCents > 0 && !fullyRefunded(order)) fail(409, '已结清订单请通过退款操作处理剩余服务，保留款项来源');
+      workflow.assertDirect(req, { action: 'orderCancel', targetId: order.id, reason });
       const before = { status: order.status, assignments: clone(order.assignments) };
       order.assignments.forEach(assignment => {
         if (['assigned', 'serving'].includes(assignment.status)) { assignment.status = 'cancelled'; assignment.endedAt = now(); assignment.reason = reason; }
       });
+      order.terminatedItemIds = order.items.filter(item => !order.assignments.some(a => a.itemId === item.id && a.status === 'completed')).map(item => item.id);
       order.status = 'cancelled'; saveOrder(order);
       audit(req, '取消订单及剩余安排', 'order', order.id, order.code, before, { status: order.status, assignments: order.assignments }, reason);
       return order;
     }); res.json(result);
   });
-  app.post('/api/orders/:id/owner', (req, res) => { const body = z.object({ ownerId: requiredText(80), reason: requiredText(1000) }).parse(req.body); const result = tx(() => { const order = get<Order>('orders', String(req.params.id)); const oldOwner = order.ownerId; order.ownerId = owner(body.ownerId, oldOwner); saveOrder(order); audit(req, '交接订单跟进人', 'order', order.id, order.code, { ownerId: oldOwner }, { ownerId: order.ownerId }, body.reason); return order; }); res.json(result); });
+  app.post('/api/orders/:id/owner', (req, res) => { assertAdmin(req); const body = z.object({ ownerId: requiredText(80), reason: requiredText(1000) }).parse(req.body); const result = tx(() => { const order = get<Order>('orders', String(req.params.id)); const oldOwner = order.ownerId; order.ownerId = owner(body.ownerId, oldOwner); saveOrder(order); audit(req, '交接订单跟进人', 'order', order.id, order.code, { ownerId: oldOwner }, { ownerId: order.ownerId }, body.reason); return order; }); res.json(result); });
 
   app.post('/api/accounts', (req, res) => {
     assertAdmin(req);
-    const body = z.object({ username: z.string().trim().min(3).max(40).regex(/^[a-zA-Z0-9_.-]+$/, '登录名仅支持字母、数字、下划线和短横线'), name: requiredText(60), password: passwordSchema, role: z.enum(['admin', 'staff', 'shareholder']), permissions: z.array(z.enum(permissions)).default([]), active: z.boolean().default(true), canManageAdmins: z.boolean().default(false) }).parse(req.body);
+    const body = z.object({ username: z.string().trim().min(3).max(40).regex(/^[a-zA-Z0-9_.-]+$/, '登录名仅支持字母、数字、下划线和短横线'), name: requiredText(60), password: passwordSchema, role: z.enum(['admin', 'staff', 'shareholder']), permissions: z.array(z.enum(accountPermissions)).max(accountPermissions.length).default([]), active: z.boolean().default(true), canManageAdmins: z.boolean().default(false) }).parse(req.body);
     assertAccountTarget(req, body.role);
     const actor = (req as unknown as AuthedRequest).actor;
     if (body.canManageAdmins && actor.role !== 'root') fail(403, '只有root可以授予管理员账号管理权限');
     if (body.canManageAdmins && body.role !== 'admin') fail(400, '此授权仅适用于普通管理员');
+    if (body.permissions.some(permission => elevatedPermissions.includes(permission)) && (body.role !== 'admin' || actor.role !== 'root')) fail(403, '高级直接办理权限只能由root授予管理员，不能下放或转授');
+    if (body.role === 'staff' && body.permissions.some(permission => !has(actor, permission))) fail(403, '不能授予当前管理员本人没有的业务权限');
     const result = tx(() => {
       if (list<StoredUser>('users').some(u => u.username.toLowerCase() === body.username.toLowerCase())) fail(409, '此登录名已经存在');
-      const user: StoredUser = { id: id(), username: body.username, name: body.name, role: body.role, permissions: body.role === 'admin' ? [...permissions] : body.role === 'shareholder' ? [] : body.permissions, canManageAdmins: body.role === 'admin' && body.canManageAdmins, active: body.active, passwordHash: hashPassword(body.password), mustChangePassword: true };
+      const user: StoredUser = { id: id(), username: body.username, name: body.name, role: body.role, permissions: body.role === 'admin' ? [...new Set([...permissions, ...body.permissions])] : body.role === 'shareholder' ? [] : [...new Set(body.permissions)], canManageAdmins: body.role === 'admin' && body.canManageAdmins, active: body.active, passwordHash: hashPassword(body.password), mustChangePassword: true, version: 1 };
       put('users', user); audit(req, '创建工作人员账号', 'account', user.id, user.name, null, safeUser(user)); return safeUser(user);
     }); res.status(201).json(result);
   });
@@ -710,17 +764,27 @@ export function createApp(options: AppOptions = {}) {
     const result = tx(() => {
       const user = get<StoredUser>('users', String(req.params.id));
       assertAccountTarget(req, user.role);
-      const body = z.object({ name: requiredText(60).optional(), role: z.enum(['admin', 'staff', 'shareholder']).optional(), permissions: z.array(z.enum(permissions)).optional(), active: z.boolean().optional(), password: passwordSchema.optional(), canManageAdmins: z.boolean().optional() }).parse(req.body);
+      if (user.deletedAt || user.archivedAt) fail(409, '请先从回收站恢复账号；恢复后需重新授权');
+      if (req.body.version !== undefined) checkVersion({ version: user.version || 1 }, req.body.version);
+      const body = z.object({ name: requiredText(60).optional(), role: z.enum(['admin', 'staff', 'shareholder']).optional(), permissions: z.array(z.enum(accountPermissions)).max(accountPermissions.length).optional(), active: z.boolean().optional(), password: passwordSchema.optional(), canManageAdmins: z.boolean().optional() }).parse(req.body);
       const nextRole = body.role ?? user.role;
       assertAccountTarget(req, nextRole);
       const actor = (req as unknown as AuthedRequest).actor;
       const before = safeUser(user);
+      const oldAdvanced = elevatedPermissions.filter(permission => user.permissions.includes(permission));
+      const nextPermissions = nextRole === 'shareholder' ? [] : body.permissions ?? (user.role === nextRole ? user.permissions : []);
+      const nextAdvanced = elevatedPermissions.filter(permission => nextPermissions.includes(permission));
+      if (body.password && actor.role !== 'root' && user.role === 'admin' && oldAdvanced.some(permission => !has(actor, permission))) fail(403, '重置持有更高业务授权的管理员密码需要root处理');
+      if (nextRole !== 'admin' && nextAdvanced.length) fail(403, '客服和股东不能获得管理员高级权限');
+      if (actor.role !== 'root' && (oldAdvanced.join(',') !== nextAdvanced.join(',') || user.role === 'admin' && nextRole !== 'admin' && (user.canManageAdmins || oldAdvanced.length))) fail(403, '高级权限的授予和收回只能由root处理，不能通过修改角色绕过');
       if (body.canManageAdmins !== undefined && body.canManageAdmins !== before.canManageAdmins && actor.role !== 'root') fail(403, '只有root可以调整管理员账号管理权限');
       if (body.canManageAdmins && nextRole !== 'admin') fail(400, '此授权仅适用于普通管理员');
+      if (nextRole === 'staff' && nextPermissions.some(permission => !has(actor, permission))) fail(403, '不能授予当前管理员本人没有的业务权限');
       Object.assign(user, body.name !== undefined ? { name: body.name } : {}, { role: nextRole }, body.active !== undefined ? { active: body.active } : {});
-      user.permissions = nextRole === 'admin' ? [...permissions] : nextRole === 'shareholder' ? [] : body.permissions ?? (before.role === 'staff' ? user.permissions : []);
+      user.permissions = nextRole === 'admin' ? [...new Set([...permissions, ...nextPermissions])] : [...new Set(nextPermissions)];
       user.canManageAdmins = nextRole === 'admin' && (body.canManageAdmins ?? (before.role === 'admin' && before.canManageAdmins === true));
       if (body.password) { user.passwordHash = hashPassword(body.password); user.mustChangePassword = true; }
+      user.version = (user.version || 1) + 1;
       put('users', user); db.prepare('DELETE FROM sessions WHERE user_id=?').run(user.id);
       audit(req, body.password ? '重置工作人员密码' : '调整工作人员授权', 'account', user.id, user.name, before, safeUser(user), body.password ? '密码已重置，原有登录全部失效' : '权限即时更新，原有登录全部失效'); return safeUser(user);
     }); res.json(result);
@@ -746,7 +810,7 @@ export function createApp(options: AppOptions = {}) {
       else if (type === 'orders') { title = '订单汇总'; rows = dateFiltered(list<Order>('orders'), req).map(o => ({ 订单编号: o.code, 订单类型: o.kind === 'supplement' ? '特殊情况补款' : '服务订单', 关联原单: o.parentOrderId ? maybe<Order>('orders', o.parentOrderId)?.code || o.parentOrderId : '', 客户: o.customerName, 状态: o.status, 应付金额: o.totalCents / 100, 累计增减款: o.adjustmentCents / 100, 调整说明: o.adjustmentReason, 余额付款: (o.payment?.walletCents || 0) / 100, 外部到账: (o.payment?.externalCents || 0) / 100, 退款金额: (sumsRefund(o).wallet + sumsRefund(o).external) / 100, 创建客服: o.createdByName, 收款客服: o.payment?.actorName || '', 服务明细: o.kind === 'supplement' ? `特殊情况补款：${o.adjustmentReason}` : o.items.map(i => `${i.mode}/${i.tier}/${i.hours}小时`).join('；'), 创建时间: o.createdAt })); }
       else if (type === 'ledger') { title = '余额流水'; rows = dateFiltered(list<LedgerEntry>('ledger'), req).map(l => ({ 客户: l.customerName, 类型: l.type, 变动金额: l.amountCents / 100, 变动后余额: l.balanceAfterCents / 100, 关联订单: l.orderId, 经办人: l.actorName, 备注: l.note, 创建时间: l.createdAt })); }
       else if (type === 'recharges') { title = '充值记录'; rows = dateFiltered(list<Recharge>('recharges'), req).map(r => ({ 客户: r.customerName, 充值类型: r.kind, 金额: r.amountCents / 100, 会员: r.member, 渠道: r.channel, 凭证编号: r.reference, 已更正: r.reversed ? '是' : '否', 经办人: r.actorName, 备注: r.note, 创建时间: r.createdAt })); }
-      else if (type === 'assignments') { title = '派单与成员应得'; rows = list<Order>('orders').flatMap(o => dateFiltered(o.assignments.map(a => ({ ...a, createdAt: a.assignedAt })), req).map(a => ({ 订单编号: o.code, 客户: o.customerName, 陪玩: a.playerName, 模式: o.items.find(i => i.id === a.itemId)?.mode, 档位: o.items.find(i => i.id === a.itemId)?.tier, 状态: a.status, 派单时间: a.assignedAt, 开始: a.startedAt || '', 结束: a.endedAt || '', 免费分钟: a.freeMinutes, ...(isAdminRole(actor.role) ? { 应得金额: a.earningCents / 100, 已结算: a.settled ? '是' : '否' } : {}), 原因: a.reason || '' }))); }
+      else if (type === 'assignments') { title = '派单与成员应得'; rows = list<Order>('orders').flatMap(o => dateFiltered(o.assignments.map(a => ({ ...a, createdAt: a.assignedAt })), req).map(a => ({ 订单编号: o.code, 客户: o.customerName, 陪玩: a.playerName, 模式: o.items.find(i => i.id === a.itemId)?.mode, 档位: o.items.find(i => i.id === a.itemId)?.tier, 状态: a.status, 派单时间: a.assignedAt, 开始: a.startedAt || '', 结束: a.endedAt || '', 免费分钟: a.freeMinutes, ...(isAdminRole(actor.role) ? { 原应得金额: a.earningCents / 100, 结算差额: list<SettlementAdjustment>('settlementAdjustments').filter(adjustment => adjustment.orderId === o.id && adjustment.assignmentId === a.id).reduce((sum, adjustment) => sum + adjustment.amountCents, 0) / 100, 应得金额: (a.earningCents + list<SettlementAdjustment>('settlementAdjustments').filter(adjustment => adjustment.orderId === o.id && adjustment.assignmentId === a.id).reduce((sum, adjustment) => sum + adjustment.amountCents, 0)) / 100, 已结算: a.settled ? '是' : '否' } : {}), 原因: a.reason || '' }))); }
       else if (type === 'audit') {
         assertAdmin(req); title = '操作审计';
         const actorId = String(req.query.actorId || ''); const action = String(req.query.action || ''); const result = String(req.query.result || ''); const query = String(req.query.q || '').toLowerCase();
