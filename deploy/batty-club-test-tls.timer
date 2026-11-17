@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for test.lihao.wiki TLS renewal daily
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=45m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
