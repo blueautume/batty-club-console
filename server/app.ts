@@ -69,6 +69,7 @@ export interface AppOptions {
 
 export function createApp(options: AppOptions = {}) {
   const production = options.production ?? process.env.NODE_ENV === 'production';
+  const testDemo = production && process.env.BATTY_TEST_DEMO === 'true';
   let publicOrigin = '';
   if (production) {
     try {
@@ -293,7 +294,11 @@ export function createApp(options: AppOptions = {}) {
     next();
   });
   app.get('/api/health', (_req, res) => res.json({ ok: true, version: '0.1.0', database: 'sqlite', time: now() }));
-  app.get('/api/public-config', (_req, res) => res.json({ demoMode: !production, clubName: settings().clubName }));
+  app.get('/api/public-config', (_req, res) => res.json({
+    demoMode: !production,
+    clubName: settings().clubName,
+    ...(testDemo ? { testDemo: true } : {})
+  }));
   const loginAttempts = new Map<string, { count: number; expires: number }>();
   app.post('/api/login', (req, res) => {
     const body = z.object({ username: requiredText(60), password: z.string().min(1).max(128) }).parse(req.body);

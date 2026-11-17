@@ -1,0 +1,10 @@
+[Unit]
+Description=Renew the test.lihao.wiki TLS certificate
+Wants=network-online.target
+After=network-online.target nginx.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/batty-club-test/acme.env
+UMask=0022
+ExecStart=/opt/batty-club-test/acme-tools/lego run --accept-tos --domains test.lihao.wiki --path /etc/batty-club-test/acme --http --http.webroot /var/lib/batty-club-test-acme --deploy-hook /opt/batty-club-test/acme-tools/reload-nginx.sh

@@ -1,0 +1,36 @@
+[Unit]
+Description=Batty Club test and demo console
+After=network.target
+
+[Service]
+Type=simple
+User=batty-club-test
+Group=batty-club-test
+WorkingDirectory=/opt/batty-club-test/current
+EnvironmentFile=/etc/batty-club-test/app.env
+Environment=PATH=/opt/batty-club-test/runtime/bin:/usr/bin:/bin
+ExecStart=/opt/batty-club-test/runtime/bin/node --experimental-strip-types server/index.ts
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=25
+UMask=0077
+StateDirectory=batty-club-test
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+InaccessiblePaths=-/opt/batty-club -/etc/batty-club -/var/lib/batty-club -/var/lib/batty-club-backups
+MemoryMax=512M
+CPUQuota=100%
+TasksMax=64
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
